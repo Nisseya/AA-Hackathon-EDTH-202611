@@ -537,6 +537,7 @@ class FleetSolver:
         unknown_ids: Sequence[str],
         deadline: float,
         max_passes: int = 5,
+        deep: bool = False,
     ) -> Tuple[List[List[str]], List[float]]:
         """Variable Neighborhood Descent on scout tours: 2-opt, Or-opt-1/2, Relocate-1/2, Swap, 2-opt*, Hungarian, Unknowns."""
         m = len(self.scouts)
@@ -632,8 +633,8 @@ class FleetSolver:
                     else:
                         i += 1
 
-            # 2b. Inter-route Or-opt-2 (move 2-contact adjacent chain to another scout)
-            if time.monotonic() < deadline:
+            # 2b. Inter-route Or-opt-2 (only in deep polish & for spatially close pairs -> fast!)
+            if deep and time.monotonic() < deadline:
                 target_scouts = [i for i in range(m) if tours[i]] + self._candidate_empty_scouts(tours)
                 for a_idx in range(m):
                     if len(tours[a_idx]) < 3 or time.monotonic() > deadline:
@@ -643,6 +644,9 @@ class FleetSolver:
                         if time.monotonic() > deadline:
                             break
                         c1, c2 = tours[a_idx][i], tours[a_idx][i + 1]
+                        if self.c_dist.get((c1, c2), INF) > 600.0:
+                            i += 1
+                            continue
                         rem_a = tours[a_idx][:i] + tours[a_idx][i + 2 :]
                         e_a_new = self.eval_scout_tour(self.scouts[a_idx], tuple(rem_a))
                         if e_a_new is None:
@@ -726,6 +730,67 @@ class FleetSolver:
                             if changed_pair:
                                 break
 
+            # 3b. Fast Tour Merge (try consolidating two tours onto a single capable scout!)
+            if time.monotonic() < deadline:
+                ne_now = [i for i in range(m) if tours[i]]
+                if len(ne_now) >= 2:
+                    # Try merging smaller tours into larger tours across all physical scouts (incl. big-battery!)
+                    cand_hosts = sorted(range(m), key=lambda idx: (-self.scouts[idx].usable_wh, _min_e_per_m(self.scouts[idx])))[:4]
+                    merged_any = False
+                    for ii in range(len(ne_now)):
+                        if merged_any or time.monotonic() > deadline:
+                            break
+                        a_idx = ne_now[ii]
+                        for jj in range(ii + 1, len(ne_now)):
+                            b_idx = ne_now[jj]
+                            ta, tb = tours[a_idx], tours[b_idx]
+                            if not ta or not tb or len(ta) + len(tb) > 14:
+                                continue
+                            cur_sum = tour_e[a_idx] + tour_e[b_idx]
+                            # Larger tour as base, insert smaller tour's stops greedily
+                            base_t, add_t = (ta, tb) if len(ta) >= len(tb) else (tb, ta)
+                            best_merge = None
+                            for h_idx in cand_hosts:
+                                host_ac = self.scouts[h_idx]
+                                if host_ac.usable_wh < cur_sum * 0.45:
+                                    continue
+                                e_cur = self.eval_scout_tour(host_ac, tuple(base_t))
+                                if e_cur is None:
+                                    continue
+                                cur_t = list(base_t)
+                                ok_m = True
+                                for cid in add_t:
+                                    de, pos = self._best_insertion_in_tour(host_ac, cur_t, e_cur, cid)
+                                    if pos == -1 or e_cur + de >= cur_sum - 1e-4:
+                                        ok_m = False
+                                        break
+                                    cur_t.insert(pos, cid)
+                                    e_cur += de
+                                if ok_m and e_cur < cur_sum - 1e-4:
+                                    if best_merge is None or e_cur < best_merge[0]:
+                                        best_merge = (e_cur, cur_t)
+                            if best_merge is not None:
+                                # Put merged tour into a_idx (Hungarian in step 4 assigns the optimal physical scout!)
+                                # Verify at least one scout (h_idx) can fly it; temporarily assign to a_idx or swap
+                                best_e_m, best_t_m = best_merge
+                                # Find best free or involved scout to hold it right now before Hungarian
+                                holder = None
+                                for cand_h in [a_idx, b_idx] + [k for k in range(m) if not tours[k]]:
+                                    eh = self.eval_scout_tour(self.scouts[cand_h], tuple(best_t_m))
+                                    if eh is not None and eh < cur_sum - 1e-4:
+                                        if holder is None or eh < holder[0]:
+                                            holder = (eh, cand_h)
+                                if holder is not None:
+                                    tours[a_idx] = []
+                                    tour_e[a_idx] = 0.0
+                                    tours[b_idx] = []
+                                    tour_e[b_idx] = 0.0
+                                    tours[holder[1]] = best_t_m
+                                    tour_e[holder[1]] = holder[0]
+                                    improved = True
+                                    merged_any = True
+                                    break
+
             # 4. Exact Hungarian Scout-to-Tour Reassignment
             old_total = sum(tour_e)
             tours, tour_e = self._hungarian_scout_match(tours)
@@ -785,6 +850,7 @@ class FleetSolver:
         rng: Optional[random.Random] = None,
         seed_tours: Optional[List[List[str]]] = None,
         vnd_passes: int = 5,
+        deep_vnd: bool = False,
     ) -> Tuple[List[List[str]], List[float], Set[str]]:
         """Full Scout VRPTW solver: Regret-2 + VND + Hungarian + ALNS."""
         if rng is None:
@@ -866,6 +932,10 @@ class FleetSolver:
                 cur_tours = [list(t) for t in cand_tours]
                 cur_e = list(cand_e)
 
+        if deep_vnd and time.monotonic() < deadline:
+            best_tours, best_e = self._vnd_scout_routes(
+                best_tours, best_e, unknown_ids, deadline, max_passes=3, deep=True
+            )
         return best_tours, best_e, best_unserved
 
     # ------------------------------------------------------------------
@@ -880,6 +950,7 @@ class FleetSolver:
         rng: Optional[random.Random] = None,
         seed_tours: Optional[List[List[str]]] = None,
         vnd_passes: int = 5,
+        deep_vnd: bool = False,
     ) -> Optional[dict]:
         """Evaluates a hostile subset S with Exact Hungarian Effectors + Scout VRPTW."""
         eff_res = self.assign_effectors(hostile_ids)
@@ -903,7 +974,7 @@ class FleetSolver:
 
         tours, tour_e, unserved_h = self.solve_scout_vrptw(
             hostile_ids, u_ids, h_prio, deadline,
-            alns_iters=alns_iters, rng=rng, seed_tours=clean_seed, vnd_passes=vnd_passes,
+            alns_iters=alns_iters, rng=rng, seed_tours=clean_seed, vnd_passes=vnd_passes, deep_vnd=deep_vnd,
         )
 
         if unserved_h:
@@ -1677,12 +1748,12 @@ class FleetSolver:
             if improved["score"] > top_sols[0]["score"] + 1e-4:
                 record_sol(improved)
 
-        # Stage 4: Deep ALNS polish on the top-1 solution's scout routes
+        # Stage 4: Deep ALNS + deep VND polish on the top-1 solution's scout routes
         if top_sols and time.monotonic() < search_deadline:
             deep_iters = 45 if n_h <= 15 else 35
             polished = self.evaluate_subset(
                 top_sols[0]["hostiles"], search_deadline,
-                alns_iters=deep_iters, rng=rng, seed_tours=top_sols[0]["tours"],
+                alns_iters=deep_iters, rng=rng, seed_tours=top_sols[0]["tours"], deep_vnd=True,
             )
             if polished is not None and polished["score"] > top_sols[0]["score"] + 1e-4:
                 record_sol(polished)

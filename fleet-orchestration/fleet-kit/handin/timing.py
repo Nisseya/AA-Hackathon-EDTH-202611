@@ -241,8 +241,9 @@ def build_scout_route(
         lo, hi = c.window
         a = lo + WIN_PAD
         if c.cls == "hostile":
+            n_eff = max(1, sum(c.needs.values()))
             avail = max(0.0, hi - lo - dwell - r.confirm_margin_s)
-            eng_buf = min(1.5, max(HOSTILE_ENG_PAD, 0.03 * avail))
+            eng_buf = min(2.0 + 3.0 * (n_eff - 1), max(HOSTILE_ENG_PAD, 0.08 * avail))
             b = hi - dwell - r.confirm_margin_s - eng_buf
         else:
             b = hi - dwell - WIN_PAD

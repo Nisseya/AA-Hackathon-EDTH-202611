@@ -15,7 +15,8 @@ Ce journal trace **chaque itération expérimentale** du solveur dans `fleet-kit
 | Baseline | `d9da7dd` | 68.0 | 277.8 | 232.9 | 423.8 | 326.5 | 275.9 | 641.2 | 418.5 | **2664.5** | 1.000× | 0.2s | 8/8 |
 | V1 | *(pré-git)* | 72.5 | 299.9 | 267.3 | 728.9 | 423.0 | 455.8 | 1664.1 | 1137.9 | **5049.4** | 1.895× | 80.5s (KO) | 8/8 |
 | V2 | *(pré-git)* | 72.5 | 299.9 | 267.3 | 729.1 | 423.0 | 453.0 | 1700.4 | 1186.1 | **5131.3** | 1.926× | 24.5s | 8/8 |
-| **V3** | *(initial)* | 72.5 | 299.3 | 267.3 | 729.1 | 423.0 | 453.0 | 1688.4 | **1244.0** | **5176.7** | **1.943×** | 39.9s | 8/8 |
+| V3 | `cb99e45` | 72.5 | 299.3 | 267.3 | 729.1 | 423.0 | 453.0 | 1688.4 | **1244.0** | **5176.7** | **1.943×** | 39.9s | 8/8 |
+| V4 | *(courant)* | 72.5 | **299.9** | 267.3 | 729.1 | 423.0 | **455.8** | 1693.7 | 1217.1 | 5158.3 | 1.936× | 37.1s | 8/8 |
 
 ---
 
@@ -101,3 +102,29 @@ L'analyse complète de `fleetkit` (`energy.py`, `validator.py`, `scorer.py`, `ge
 2. Tester le **Tour Merge (fusion explicite de 2 tournées sur un scout à grande batterie)** dans VND/Stage 4 pour réduire le nombre de scouts utilisés quand rentable (`L3-303` et `L4`).
 3. Diagnostiquer la micro-régression de `-0.6 pts` sur `L2-201` (probablement ordre shifts vs delays en déconfliction).
 4. Lancer un benchmark **hors-distribution multi-seeds** (`L1–L4, seeds 0-9`, soit 40 scénarios inédits) pour valider la généralisation !
+
+---
+
+## Expérience V4 — Tour Merge + Gating Or-opt-2 (`deep=True`) + Restauration `stagger_buf`
+
+### Intuition
+1. **Correction `L2-201` (`299.3 → 299.9`)** : le diagnostic des routes de `L2-201` a montré que `H01` grimpait à `z = 30 m` (+1.2 Wh = -0.6 pts) parce que la réduction de `stagger_buf` en V3 (1.5 s max) ne laissait que 1.5 s d'écart entre `H03` et `H01`, provoquant un rattrapage en vol. Restaurer `stagger_buf = min(2.0 + 3.0*(n_eff-1), 0.08*avail)` préserve le vol `z = 0` sans surcoût.
+2. **Tour Merge (`3b` dans VND)** : sur `L3-303`, l'appariement Hongrois plaçait la grosse tournée sur un scout économe à petite batterie (`S04`, 29.1 Wh), bloquant la fusion d'une petite tournée de 2 contacts. Un opérateur explicite de fusion de deux tournées sur un scout grande-batterie doit éliminer des trajets base↔terrain.
+3. **Gating de `Or-opt-2` inter-route** : réservé au polish final `deep=True` (Stage 4) et filtré aux paires proches (`c_dist <= 600 m`) pour regagner la vitesse V2 sur L4.
+
+### Résultats V4 (Validation Set)
+- **Total : 5158.3** (**1.936× baseline**), 8/8 valides :
+  - `L1-101` : **72.5** (0.01 s)
+  - `L2-201` : **299.9** (0.18 s) — **+0.6 pts** (exactement comme prédit !)
+  - `L2-202` : **267.3** (0.29 s)
+  - `L3-301` : **729.1** (3.65 s)
+  - `L3-302` : **423.0** (0.97 s)
+  - `L3-303` : **455.8** (2.27 s) — **+2.8 pts (-5.5 Wh)** grâce à Tour Merge !
+  - `L4-401` : **1693.7** (37.08 s) — **+5.3 pts** vs V3, mais encore 37.1 s (vs 24.5 s en V2)
+  - `L4-402` : **1217.1** (28.32 s) — **-26.9 pts** vs V3 (1244.0) !
+
+### Analyse scientifique (ablation nécessaire pour V5)
+- **Victoire totale sur L1–L3** : tous les 6 scénarios L1–L3 égalent ou battent leur meilleur score historique (`72.5 + 299.9 + 267.3 + 729.1 + 423.0 + 455.8 = 2247.6`).
+- **Deux points à isoler immédiatement par ablation** :
+  1. Pourquoi `L4-402` a perdu 26.9 pts entre V3 et V4 ? Hypothèse : soit `stagger_buf` (0.08×avail = jusqu'à 11 s retirées aux fenêtres serrées de L4-402), soit `Tour Merge` qui a consommé du budget CPU dans VND.
+  2. Pourquoi `L4-401` prend encore 37 s (vs 24.5 s en V2) ? Hypothèse : `Tour Merge (3b)` + `Or-opt-2` intra-route tournent à CHAQUE passe de VND interne (dans chaque itération ALNS et chaque swap hostile), + `_candidate_empty_scouts` évalue 3 scouts vides au lieu de 1 dans les boucles internes.
