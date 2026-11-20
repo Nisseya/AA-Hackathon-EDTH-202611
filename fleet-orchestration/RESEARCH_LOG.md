@@ -1,0 +1,103 @@
+# Rapport de Recherche — Fleet Orchestration (EDTH Paris 2026)
+
+Ce journal trace **chaque itération expérimentale** du solveur dans `fleet-kit/handin/`, avec :
+- **Version / Commit Git** permettant de revenir à tout état antérieur.
+- **Intuition & hypothèses** (physique, mathématiques, diagnostics d'erreurs).
+- **Modifications précises** apportées au code.
+- **Résultats quantitatifs** (validation set `L1-101..L4-402`, temps d'exécution, validité R1–R10, et benchmarks hors-distribution sur seeds jamais vus).
+
+---
+
+## Tableau Récapitulatif Global (Validation Set 8 scénarios)
+
+| Version | Commit | L1-101 | L2-201 | L2-202 | L3-301 | L3-302 | L3-303 | L4-401 | L4-402 | **TOTAL** | **Ratio Base** | Max Time | Valid |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| Baseline | `d9da7dd` | 68.0 | 277.8 | 232.9 | 423.8 | 326.5 | 275.9 | 641.2 | 418.5 | **2664.5** | 1.000× | 0.2s | 8/8 |
+| V1 | *(pré-git)* | 72.5 | 299.9 | 267.3 | 728.9 | 423.0 | 455.8 | 1664.1 | 1137.9 | **5049.4** | 1.895× | 80.5s (KO) | 8/8 |
+| V2 | *(pré-git)* | 72.5 | 299.9 | 267.3 | 729.1 | 423.0 | 453.0 | 1700.4 | 1186.1 | **5131.3** | 1.926× | 24.5s | 8/8 |
+| **V3** | *(initial)* | 72.5 | 299.3 | 267.3 | 729.1 | 423.0 | 453.0 | 1688.4 | **1244.0** | **5176.7** | **1.943×** | 39.9s | 8/8 |
+
+---
+
+## Expérience V1 — Architecture Fondamentale (2D Knapsack + Hungarian + Disk-TSP ALNS + 3D Deconfliction)
+
+### Intuition physique & mathématique
+L'analyse complète de `fleetkit` (`energy.py`, `validator.py`, `scorer.py`, `geometry.py`) a révélé plusieurs leviers majeurs inexploités par la baseline gloutonne :
+1. **Vitesse optimale `v* = sqrt(p0 / k_v)`** : pour quasi tous les effecteurs, `v* >= v_h_mps`, donc voler à vitesse maximale `v_h_mps` est strictement optimal en énergie. Pour les scouts, l'énergie de croisière est strictement convexe en durée de segment : ralentir uniformément sur le slack disponible est toujours strictement moins cher que voler vite et stationner.
+2. **Montée/descente diagonale & vol direct `z=0` pour les effecteurs** : R2 autorise la montée/descente en diagonale sur la première et dernière jambe (évite le coût temps+énergie de la montée verticale au pad), et `low = 0.0` sur le dernier waypoint `k == len(w) - 1`, permettant `[home(z=0), engage(z=0)]` sans montée quand le corridor est dégagé (~19 pts économisés en L4).
+3. **Disk-TSP** : à `z = 30 m`, le rayon horizontal d'observation est `sqrt(150² - 30²) = 146.97 m`. Des contacts proches (<294 m) ont des disques qui se chevauchent (0 m de vol entre eux).
+4. **Hétérogénéité de la flotte** : jusqu'à 60% d'écart en `Wh/m` entre le meilleur et le pire aéronef. Un appariement exact (algorithme Hongrois rectangulaire `O(n·m²)`) des effecteurs aux cibles et des scouts aux tournées économise des centaines de Wh.
+5. **Décomposition couplée** : sélection du sous-ensemble optimal d'hostiles par Knapsack 2D exact (capacités `light`, `heavy`) + tarification itérative des coûts marginaux scouts/effecteurs + ALNS/VND pour le VRPTW des scouts + moteur de déconfliction 3D R8 indexé par AABB.
+
+### Résultats V1
+- **Total validation : 5049.4** (**1.895× baseline**), 8/8 valides.
+- **L3-301 : 1007/1007 pts servis (100%)**.
+- **Problèmes identifiés** :
+  - **Timeout sur `L4-402` (80.51 s > 60 s)** : 85 effecteurs sur des pads distincts provoquaient 4746 cache-misses dans le routage 2D Dijkstra (polygones 24 côtés), prenant 39.57 s rien qu'à l'init.
+  - **Perte en déconfliction sur `L4-402` (-81 pts)** : 4 scouts lancés à `t0 = 0.0` côte à côte (`11.1 m` entre pads) échouaient au décollage car un décalage uniforme violait les fenêtres tendues ou la batterie.
+
+---
+
+## Expérience V2 — Accélération 67× du Routage 2D + Déconfliction ciblée au décollage
+
+### Intuition
+1. **Cache spatial grossier 160 m + A* + polygones 16 côtés (`geometry3d.py`)** : tous les pads étant regroupés dans une boîte 100×100 m, les sommets intermédiaires de contournement d'obstacles sont quasi identiques pour tous les effecteurs vers une même cible. Réutiliser les sommets intermédiaires + shortcutting exact élimine les cache-misses.
+2. **Retard de décollage seul (`min_t0`) et avance d'atterrissage seule (`max_t_land`) dans `timing.py`** : décaler uniquement `t0` de quelques secondes (attente gratuite au sol, non comptée en R8) résout les conflits de pad à `t = 0..10 s` sans déplacer les fenêtres d'observation serrées, pour ~0.01 Wh.
+3. **Substitution par scout libre et découpage de tournée** dans `deconflict.py` / `solver.py` si un scout échoue encore.
+
+### Résultats V2
+- **Init `L4-402`** : **39.57 s → 0.59 s (67× plus rapide !)**.
+- **Temps total `L4-402`** : **80.51 s → 15.50 s** ; `L4-401` : **40.57 s → 24.48 s**.
+- **Score total : 5049.4 → 5131.3 (+81.9 pts, 1.926× baseline)**, 8/8 valides :
+  - `L4-401` : **1664.1 → 1700.4 (+36.3 pts)**
+  - `L4-402` : **1137.9 → 1186.1 (+48.2 pts)**
+  - Régression mineure sur `L3-303` : `455.8 → 453.0 (-2.8 pts)` due au buffer `stagger_buf` trop conservateur.
+
+### Diagnostics effectués sur V2 (révélations majeures pour V3)
+1. **Bug des scouts libres (`empty_scouts[0]`)** : sur `L4-402`, 2 unknowns rentables même en solo (`C62` : +11 pts, `C66` : +13 pts) n'étaient pas servis car `empty_scouts[0]` était un petit scout (26.8 Wh) incapable d'atteindre 36 Wh, alors que `S05` (49.1 Wh) ou `S11` (43.6 Wh) étaient libres !
+2. **Ordre de placement des scouts en déconfliction** : `S07` (33.1/33.2 Wh, 0.1 Wh de marge) et `S09` (39.6/40.0 Wh, 0.4 Wh de marge) étaient placés après des scouts à grosse marge batterie et échouaient en déconfliction (-72 pts sur `L4-402`).
+3. **Conflit `C11` vs `S15` sur `L4-401` (-19.6 pts)** :
+   - `build_effector_route(..., z_cruise > 0)` ne plaçait pas de waypoint de montée rapide près de la base → l'effecteur montait en rampe douce sur 2.5 km et restait à `z < 10 m` dans le corridor d'atterrissage de `S15`.
+   - `_try_dodge_chain` sur effecteurs (Tier 4) tournait avec `extra_duration=0.0` (vitesse max `v_h_mps` = 0 s de slack), faisant toujours échouer `_insert_local_dodge`.
+4. **Tarification effecteurs inactifs** : `_compute_true_marginals` utilisait `est_eff_e` (meilleurs effecteurs globaux même déjà occupés) au lieu des **potentiels duaux exacts du Hongrois** (`u, v`).
+
+---
+
+## Expérience V3 — Potentiels Duaux Hongrois + Scouts Libres Diversifiés + Early-Climb Effectors + Or-opt-2
+
+### Modifications testées
+1. `assignment.py` : ajout de `hungarian_min_cost_duals` retournant `(total, col_for_row, row_u, col_v)` exacts.
+2. `solver.py` :
+   - `_candidate_empty_scouts` exposant jusqu'à 3 scouts libres diversifiés (plus économe, **plus grosse batterie**, plus rapide) dans `_regret2_construct`, `_vnd_scout_routes` et `_compute_true_marginals`.
+   - Utilisation des potentiels duaux Hongrois (`u_by_cid`, `v_light`, `v_heavy`) dans `_compute_true_marginals`.
+   - Tri des scouts en déconfliction par **marge batterie croissante** (`usable_wh - tour_e`) + rip-up & re-order + smart split sur tous les points de coupe.
+   - Rescue effecteurs : 3 combinaisons d'effecteurs libres + avance d'observation scout si fenêtre serrée.
+   - Ajout de **Or-opt-2** (intra-route et inter-route) dans `_vnd_scout_routes`.
+3. `timing.py` :
+   - Réduction de `stagger_buf` sur les fenêtres hostiles (grâce à l'exemption R8 dans les 60 m de la cible).
+   - Waypoint de montée rapide `c_pt` près du pad dans `build_effector_route` quand `z_cruise > 0`.
+4. `deconflict.py` :
+   - Pas de décalage plus fins pour scouts (`1.5 s, 3.0 s, ...`).
+   - Tier 4 effecteurs avec `extra_duration = 6.0 / 14.0` pour donner du slack réel à `_try_dodge_chain`.
+
+### Résultats V3 (Validation Set)
+- **Total : 5131.3 → 5176.7 (+45.4 pts, 1.943× baseline)**, 8/8 valides :
+  - `L1-101` : 72.5 (0.00 s)
+  - `L2-201` : 299.3 (0.18 s) *(-0.6 pts vs V2)*
+  - `L2-202` : 267.3 (0.27 s)
+  - `L3-301` : 729.1 (2.17 s)
+  - `L3-302` : 423.0 (1.32 s)
+  - `L3-303` : 453.0 (2.70 s)
+  - `L4-401` : **1688.4 (39.87 s)** *(-12.0 pts et +15.4 s vs V2 !)*
+  - `L4-402` : **1244.0 (29.07 s)** *(**+57.9 pts** vs V2, **+106.1 pts** vs V1 !)*
+
+### Analyse critique de V3 (pourquoi `L4-401` a ralenti et baissé de 12 pts)
+- **Succès massif sur `L4-402` (+57.9 pts)** : les corrections sur les scouts libres grande-batterie + tri par marge batterie + rip-up + early-climb ont fonctionné exactement comme prévu.
+- **Cause de la régression sur `L4-401` (24.5 s → 39.9 s, 1700.4 → 1688.4)** : l'ajout de **Or-opt-2 inter-route (`2b`)** à CHAQUE passe de `_vnd_scout_routes` (appelé dans chaque itération ALNS et chaque swap hostile) a multiplié par ~3 le coût de VND sur L4 (`~12 000` évaluations par passe), faisant expirer `search_deadline` trop tôt et privant Stages 2/3/4/6 de budget d'exploration !
+- **Piste supplémentaire identifiée sur `L3-303`** : lorsque le Hongrois affecte les tournées aux scouts, le scout le plus économe (`Wh/m`) mais à petite batterie (`S04`, 29.1 Wh) absorbe la grosse tournée et sature sa batterie, empêchant de fusionner 3 tournées en 2 tournées (alors qu'un scout à grande batterie `S03`, 44.1 Wh + `S05`, 33.9 Wh permettrait de réduire le nombre de scouts et d'économiser ~6 Wh).
+
+### Prochaine itération planifiée : V4
+1. Retirer `Or-opt-2` inter-route des passes VND rapides (le réserver uniquement au polish final Stage 4, ou le filtrer spatialement aux paires très proches `< 400 m`) → retrouver la vitesse <20 s sur L4 et débloquer tout le budget de recherche Stages 2/3/4/6 !
+2. Tester le **Tour Merge (fusion explicite de 2 tournées sur un scout à grande batterie)** dans VND/Stage 4 pour réduire le nombre de scouts utilisés quand rentable (`L3-303` et `L4`).
+3. Diagnostiquer la micro-régression de `-0.6 pts` sur `L2-201` (probablement ordre shifts vs delays en déconfliction).
+4. Lancer un benchmark **hors-distribution multi-seeds** (`L1–L4, seeds 0-9`, soit 40 scénarios inédits) pour valider la généralisation !
