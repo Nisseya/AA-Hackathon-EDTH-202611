@@ -1157,6 +1157,67 @@ class FleetSolver:
             if placed_ok:
                 continue
 
+            # Blocker-Relocation Rescue: if `ac` is blocked by an already-placed scout `bid` (e.g., adjacent pad at t0=0),
+            # move the BLOCKING scout `bid`'s tour onto an idle scout on a distant pad so `ac` launches cleanly!
+            if not placed_ok and placed_scout_tours and idle_scouts and time.monotonic() < deadline:
+                obs_pts_b = self.obs_map.optimize_disk_tour(ac.home[:2], contacts, self.r.z_min_m)
+                nom_b = build_scout_route(ac, contacts, obs_pts_b, self.r.z_min_m, self.obs_map, self.sc)
+                if nom_b is not None:
+                    # Collect up to 2 blocking scouts encountered at nominal launch/flight
+                    blockers: List[str] = []
+                    cf_b = sep.first_conflict(ac.id, nom_b[0])
+                    if cf_b is not None and cf_b[0] in placed_scout_tours:
+                        blockers.append(cf_b[0])
+                    for bid in blockers:
+                        bcids = placed_scout_tours[bid]
+                        bcontacts = [self.contact_map[x] for x in bcids]
+                        old_bwps = sep.routes_json[bid]
+                        # Candidate idle scouts for blocker `bid`, preferring pads far from `ac` and low energy
+                        b_idles = []
+                        for ia in idle_scouts:
+                            if ia.id == ac.id:
+                                continue
+                            eb = self.eval_scout_tour(ia, tuple(bcids))
+                            if eb is not None:
+                                b_idles.append((0 if hdist(ia.home, ac.home) >= 52.0 else 1, eb, ia))
+                        if not b_idles:
+                            continue
+                        b_idles.sort(key=lambda x: (x[0], x[1]))
+                        sep.remove(bid)
+                        res_ac = place_scout_deconflicted(
+                            ac, contacts, self.obs_map, self.sc, sep, preferred_z=self.r.z_min_m
+                        )
+                        if res_ac is not None:
+                            sep.add(ac.id, res_ac[0])
+                            moved_b = None
+                            for _, _, ia in b_idles[:5]:
+                                r_ia = place_scout_deconflicted(
+                                    ia, bcontacts, self.obs_map, self.sc, sep, preferred_z=self.r.z_min_m
+                                )
+                                if r_ia is not None:
+                                    moved_b = (ia, r_ia)
+                                    break
+                            if moved_b is not None:
+                                ia, r_ia = moved_b
+                                sep.add(ia.id, r_ia[0])
+                                obs_end_by_cid.update(res_ac[2])
+                                obs_end_by_cid.update(r_ia[2])
+                                placed_scout_tours.pop(bid, None)
+                                scout_headroom.pop(bid, None)
+                                placed_scout_tours[ac.id] = cids
+                                placed_scout_tours[ia.id] = bcids
+                                scout_headroom[ac.id] = ac.usable_wh - res_ac[1]
+                                scout_headroom[ia.id] = ia.usable_wh - r_ia[1]
+                                placed_ok = True
+                                break
+                            else:
+                                sep.remove(ac.id)
+                                sep.add(bid, old_bwps)
+                        else:
+                            sep.add(bid, old_bwps)
+            if placed_ok:
+                continue
+
             # 2-way & 3-way Physical Scout Swap Rescue (fixes pinned t0=0 scouts on adjacent pads <50m apart!)
             # Swap `cids` onto an already-placed scout `other_ac` (whose pad is far away / later t0),
             # and move `other_ac`'s tour onto `ac` or an idle scout!
@@ -1274,8 +1335,9 @@ class FleetSolver:
                     placed_ok = True
 
             if not placed_ok:
-                # Last resort: trim lowest-value contact one by one on original scout
+                # Last resort: smart surgical trimming — try removing EACH single contact first so 1 pinned stop doesn't destroy the whole tour!
                 cur_cids = list(cids)
+                dropped_from_tour: List[str] = []
                 while len(cur_cids) >= 1:
                     res = place_scout_deconflicted(
                         ac, [self.contact_map[x] for x in cur_cids], self.obs_map, self.sc, sep, preferred_z=self.r.z_min_m
@@ -1285,11 +1347,48 @@ class FleetSolver:
                         obs_end_by_cid.update(res[2])
                         placed_scout_tours[ac.id] = cur_cids
                         break
+                    if len(cur_cids) >= 2:
+                        best_sub = None
+                        for drop_idx, drop_cand in enumerate(cur_cids):
+                            sub_cids = cur_cids[:drop_idx] + cur_cids[drop_idx + 1 :]
+                            sub_contacts = [self.contact_map[x] for x in sub_cids]
+                            r_sub = place_scout_deconflicted(
+                                ac, sub_contacts, self.obs_map, self.sc, sep, preferred_z=self.r.z_min_m
+                            )
+                            if r_sub is not None:
+                                kept_val = sum(self.contact_map[x].points for x in sub_cids) - self.r.lambda_e * r_sub[1]
+                                if best_sub is None or kept_val > best_sub[0]:
+                                    best_sub = (kept_val, sub_cids, r_sub, drop_cand)
+                        if best_sub is not None:
+                            _, sub_cids, r_sub, drop_cand = best_sub
+                            sep.add(ac.id, r_sub[0])
+                            obs_end_by_cid.update(r_sub[2])
+                            placed_scout_tours[ac.id] = sub_cids
+                            dropped_from_tour.append(drop_cand)
+                            break
                     drop_c = min(
                         cur_cids,
                         key=lambda x: (0 if self.contact_map[x].cls == UNKNOWN else 1, self.contact_map[x].points),
                     )
                     cur_cids.remove(drop_c)
+                    dropped_from_tour.append(drop_c)
+                # Try to rescue any dropped high-value contacts solo onto remaining idle scouts
+                for d_cid in sorted(dropped_from_tour, key=lambda x: -self.contact_map[x].points):
+                    dc = self.contact_map[d_cid]
+                    rem_idles = [a for a in self.scouts if a.id not in placed_scout_tours]
+                    scored_d = []
+                    for ia in rem_idles:
+                        ed = self.eval_scout_tour(ia, (d_cid,))
+                        if ed is not None and dc.points - self.r.lambda_e * ed > 1.0:
+                            scored_d.append((ed, ia))
+                    scored_d.sort(key=lambda x: x[0])
+                    for _, ia in scored_d[:3]:
+                        r_d = place_scout_deconflicted(ia, [dc], self.obs_map, self.sc, sep, preferred_z=self.r.z_min_m)
+                        if r_d is not None:
+                            sep.add(ia.id, r_d[0])
+                            obs_end_by_cid.update(r_d[2])
+                            placed_scout_tours[ia.id] = [d_cid]
+                            break
 
         # 2. Place effector groups (tightest slack first)
         eff_by_cid: Dict[str, List[Aircraft]] = sol["eff_by_cid"]
@@ -1815,8 +1914,8 @@ class FleetSolver:
                 return
             top_sols.append(sol)
             top_sols.sort(key=lambda s: -s["score"])
-            if len(top_sols) > 4:
-                del top_sols[4:]
+            if len(top_sols) > 8:
+                del top_sols[8:]
 
         # Stage 1: Initial Exact 2D Knapsack seeds across scout-sharing factors
         alphas = (0.20, 0.45, 0.80, 0.05) if n_h > 6 else (0.15, 0.50, 1.0)
@@ -1901,14 +2000,14 @@ class FleetSolver:
         best_valid_score: float = 0.0
 
         dedup_sols: List[dict] = []
-        seen_keys: Set[Tuple[frozenset, float]] = set()
+        seen_keys: Set[Tuple[frozenset, float, float]] = set()
         for s in top_sols:
-            k = (frozenset(s["hostiles"]), round(s["score"], 2))
+            k = (frozenset(s["hostiles"]), round(s["score"], 2), round(s["scout_e"], 1))
             if k not in seen_keys:
                 seen_keys.add(k)
                 dedup_sols.append(s)
 
-        for idx, sol in enumerate(dedup_sols[:3]):
+        for idx, sol in enumerate(dedup_sols[:5]):
             if idx > 0 and time.monotonic() > hard_deadline - 2.0:
                 break
             plan, score = self.deconflict_and_build_plan(sol, hard_deadline)
