@@ -332,3 +332,48 @@ Générés via `python3 handin/planner.py` et validés via `python3 -m fleetkit 
 - `L3-303.json` : **455.76** (`746.0 pts`, `160.5 Wh`, `21 eff`)
 - `L4-401.json` : **1717.73** (`2678.0 pts`, `760.5 Wh`, `58 eff`)
 - `L4-402.json` : **1261.00** (`2260.0 pts`, `878.0 Wh`, `56 eff`)
+
+---
+
+## Stress-Test Grande Échelle — 1 000 Scénarios Inédits sur RunPod (`L1–L4`, seeds `1000..1249`)
+
+### Protocole & Infrastructure
+- **Objectif** : soumettre la version finale **V9** (commit `e603705`) à une campagne hors-distribution massive de **1 000 scénarios complètement inédits** (`250` par niveau `L1, L2, L3, L4`, seeds `1000..1249`) afin de détecter tout cas limite latent (crash, timeout `> 60 s`, violation R1–R10, perte face à la baseline, chute en déconfliction).
+- **Exécution** : chaque scénario est exécuté dans un sous-processus isolé `python3 handin/planner.py` avec **timeout strict `60.0 s`**, puis évalué par `fleetkit.scorer.evaluate` et comparé à `fleetkit.baseline.greedy_plan`.
+- **Infrastructure cloud** : **4 pods CPU RunPod (`cpu5c × 32 vCPU`, 16 workers/pod = 2 vCPU dédiés par scénario)** orchestrés via l'API REST v2 (`https://api.runpod.io/v2/pods`), serveur HTTP interne sur port `8000` interrogé via proxy HTTPS RunPod, sauvegarde incrémentale par shard, watchdog anti-hôte ralenti, et suppression automatique vérifiée (`0` pod actif en fin de run, coût total de la campagne : **\$0.86**).
+- **Durée totale** : `~101–108 s` de calcul par shard de 250 scénarios (`509.0 s` wall-clock avec watchdog/respawns réseau).
+
+### Résultats Globaux (1 000 / 1 000 Scénarios)
+
+| Niveau | N | Valides | Timeouts | Crashs | Viol. | Score V9 (Σ) | Baseline (Σ) | Ratio Σ | Win Rate | Moyenne V9 | Médiane V9 | Écart-type | Min | Max |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **L1** | 250 | **250/250** | 0 | 0 | 0 | **25 373.0** | 22 934.1 | **1.106×** | **100.0%** | 101.49 | 95.58 | 37.29 | 2.7 | 233.4 |
+| **L2** | 250 | **250/250** | 0 | 0 | 0 | **64 983.1** | 56 966.0 | **1.141×** | **100.0%** | 259.93 | 255.60 | 62.02 | 70.8 | 430.8 |
+| **L3** | 250 | **250/250** | 0 | 0 | 0 | **135 217.7** | 97 921.2 | **1.381×** | **100.0%** | 540.87 | 534.87 | 82.48 | 341.6 | 773.4 |
+| **L4** | 250 | **250/250** | 0 | 0 | 0 | **379 436.5** | 132 951.3 | **2.854×** | **100.0%** | **1517.75** | **1529.24** | 214.17 | 964.2 | **2124.3** |
+| **TOTAL** | **1000** | **1000/1000** | **0** | **0** | **0** | **605 010.2** | **310 772.6** | **1.947×** | **100.0%** | **605.01** | 380.26 | 562.97 | 2.7 | **2124.3** |
+
+### Temps d'Exécution, Couverture & Distribution des Gains
+
+| Niveau | `t_moy` | `t_p95` | `t_p99` | `t_max` | Hostiles servis | Unknowns servis | Wh moy. | Eff. moy. | Gain moy. (V9 − Base) | Gain min | Gain max | Ratio méd. | Ratio min–max |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **L1** | 0.04 s | 0.06 s | 0.08 s | **0.10 s** | 51.60% (387/750) | 99.60% (249/250) | 22.9 | 2.1 | +9.76 | +0.80 | +88.54 | 1.063× | 1.011×–3.028× |
+| **L2** | 0.17 s | 0.27 s | 0.38 s | **0.42 s** | 69.53% (1043/1500) | 100.00% (750/750) | 61.1 | 6.5 | +32.07 | +1.98 | +138.93 | 1.114× | 1.016×–1.755× |
+| **L3** | 0.73 s | 1.37 s | 1.86 s | **2.23 s** | 69.69% (2439/3500) | 99.27% (1489/1500) | 184.5 | 19.5 | +149.19 | +46.65 | +293.89 | 1.369× | 1.098×–2.424× |
+| **L4** | 17.97 s | 35.98 s | 40.50 s | **40.99 s** | 60.40% (7550/12500) | 85.64% (4282/5000) | 861.5 | 61.6 | **+985.94** | **+522.18** | **+1421.50** | **2.880×** | **1.792×–8.864×** |
+
+- **Histogramme temps L4 (250 scénarios)** : `< 20 s` : **175 (70.0%)** · `20–30 s` : **51 (20.4%)** · `30–40 s` : **15 (6.0%)** · `40–45 s` : **9 (3.6%)** · **`> 45 s` : 0 (0.0%)**. Marge de sécurité minimale de **19.0 s** sous la limite officielle de `60 s`.
+- **Records notables sur L4** :
+  - Meilleur score absolu : **`L4-1047`** = **2124.3** vs `754.6` (`2.82×`, `39/46` hostiles atteignables, `17/20` unknowns, `36.6 s`).
+  - Meilleur ratio : **`L4-1228`** = **1345.6** vs `151.8` (**`8.86×`**), suivi de `L4-1164` (**`7.38×`**) et `L4-1063` (**`6.85×`**).
+
+### Audit des Outliers (Pires Ratios, Pires Scores & Scénarios les Plus Lents sur L4)
+L'inspection ciblée des cas extrêmes confirme qu'**aucun dysfonctionnement algorithmique** n'est à l'origine des queues de distribution :
+1. **Pire ratio L4 (`L4-1126`, `1181.8` vs `659.6`, `1.79×`)** : géométrie peu dense (`27` hostiles et `19` unknowns atteignables seulement, `2085 pts` atteignables au total) — V9 sert **`25/27` hostiles (`92.6%`)** et **`18/19` unknowns (`94.7%`)**, capturant **`94.3%`** de tous les points individuellement atteignables (`1967 / 2085 pts`).
+2. **Pires scores absolus L4 (`L4-1203 = 964.2`, `L4-1004 = 968.0`, `L4-1177 = 989.9`)** :
+   - `L4-1004` : seulement `23` hostiles atteignables sur `50` — V9 en sert **`21/23` (`91.3%`)** et **`15/17` unknowns**, soit **`94.5%`** des points atteignables (`1858 / 1966 pts`), `2.93×` baseline.
+   - `L4-1177` : déficit structurel en effecteurs légers (`50` lights disponibles pour une demande atteignable de `73` lights) — V9 sature les `50/50` lights + `5` heavies sur les cibles de rentabilité maximale (`2.45×` baseline).
+3. **Scénarios les plus lents (`L4-1211 = 40.99 s`, `L4-1022 = 40.94 s`, `L4-1017 = 40.52 s`, `L4-1069 = 40.48 s`)** : instances de densité maximale (`34–38` hostiles + `16–20` unknowns servis, `62–73` effecteurs) où le budget adaptatif Stage 6 borne proprement la recherche à `~40.5–41.0 s`.
+
+### Verdict
+**V9 est certifié prêt pour la compétition** : **1 000 / 1 000 valides (`100.0%`)**, **1 000 / 1 000 victoires strictes sur la baseline (`+522 pts` minimum sur L4)**, **`0` crash, `0` violation, `0` timeout (`t_max = 40.99 s` < `60 s`)**. Aucune modification V10 n'est nécessaire au risque d'introduire une régression.
