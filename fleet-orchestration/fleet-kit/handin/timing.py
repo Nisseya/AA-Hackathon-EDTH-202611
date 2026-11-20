@@ -153,6 +153,14 @@ def optimize_scout_timing(
     if t_land - (s[k - 1] + dwell_s) < leg_min_dts[k]:
         t_land = min(t_hi_bound, s[k - 1] + dwell_s + leg_min_dts[k])
 
+    # Fast early-exit: if every leg is already at ideal_dt, initialization is globally optimal!
+    if (
+        abs((s[0] - t0) - leg_ideal_dts[0]) < 1e-4
+        and abs((t_land - (s[k - 1] + dwell_s)) - leg_ideal_dts[k]) < 1e-4
+        and all(abs((s[j] - (s[j - 1] + dwell_s)) - leg_ideal_dts[j]) < 1e-4 for j in range(1, k))
+    ):
+        return t0, s, t_land
+
     # 4. Exact coordinate descent on strictly convex energy
     for _ in range(16):
         max_delta = 0.0
@@ -236,27 +244,36 @@ def build_scout_route(
     r = scenario.rules
     dwell = r.obs_dwell_s
 
-    windows: List[Tuple[float, float]] = []
-    for c in contacts:
-        lo, hi = c.window
-        a = lo + WIN_PAD
-        if c.cls == "hostile":
-            n_eff = max(1, sum(c.needs.values()))
-            avail = max(0.0, hi - lo - dwell - r.confirm_margin_s)
-            eng_buf = min(2.0 + 3.0 * (n_eff - 1), max(HOSTILE_ENG_PAD, 0.08 * avail))
-            b = hi - dwell - r.confirm_margin_s - eng_buf
-        else:
-            b = hi - dwell - WIN_PAD
-        if max_obs_end_overrides and c.id in max_obs_end_overrides:
-            b = min(b, max_obs_end_overrides[c.id] - dwell - WIN_PAD)
-        if a > b:
-            a = lo + 0.01
-            b = hi - dwell - (r.confirm_margin_s + HOSTILE_ENG_PAD if c.cls == "hostile" else 0.01)
+    def _make_windows(use_stagger: bool) -> Optional[List[Tuple[float, float]]]:
+        ws: List[Tuple[float, float]] = []
+        for c in contacts:
+            lo, hi = c.window
+            a = lo + WIN_PAD
+            if c.cls == "hostile":
+                if use_stagger:
+                    n_eff = max(1, sum(c.needs.values()))
+                    avail = max(0.0, hi - lo - dwell - r.confirm_margin_s)
+                    eng_buf = min(1.5 + 1.5 * (n_eff - 1), max(HOSTILE_ENG_PAD, 0.05 * avail))
+                else:
+                    eng_buf = HOSTILE_ENG_PAD
+                b = hi - dwell - r.confirm_margin_s - eng_buf
+            else:
+                b = hi - dwell - WIN_PAD
             if max_obs_end_overrides and c.id in max_obs_end_overrides:
-                b = min(b, max_obs_end_overrides[c.id] - dwell - 0.01)
+                b = min(b, max_obs_end_overrides[c.id] - dwell - WIN_PAD)
             if a > b:
-                return None
-        windows.append((a, b))
+                a = lo + 0.01
+                b = hi - dwell - (r.confirm_margin_s + HOSTILE_ENG_PAD if c.cls == "hostile" else 0.01)
+                if max_obs_end_overrides and c.id in max_obs_end_overrides:
+                    b = min(b, max_obs_end_overrides[c.id] - dwell - 0.01)
+                if a > b:
+                    return None
+            ws.append((a, b))
+        return ws
+
+    windows = _make_windows(use_stagger=True)
+    if windows is None:
+        return None
 
     nodes: List[Point3] = [ac.home] + [(p[0], p[1], z) for p in obs_points] + [ac.home]
     macro_pts: List[List[Point3]] = []
@@ -283,7 +300,16 @@ def build_scout_route(
         min_t0=min_t0, max_t_land=max_t_land,
     )
     if timing is None:
-        return None
+        windows_tight = _make_windows(use_stagger=False)
+        if windows_tight is None:
+            return None
+        timing = optimize_scout_timing(
+            ac, leg_dhs, leg_min, leg_ideal, windows_tight, dwell, scenario.horizon_s,
+            min_t0=min_t0, max_t_land=max_t_land,
+        )
+        if timing is None:
+            return None
+        windows = windows_tight
     t0, s_times, t_land = timing
 
     if abs(time_shift) > 1e-6:
@@ -332,6 +358,170 @@ def build_scout_route(
     if not _check_r2_fast(parsed_wps, ac, r.z_min_m, r.z_max_m, scenario.horizon_s):
         return None
     return wps, energy, obs_ends
+
+
+
+
+def eval_scout_route_energy(
+    ac: Aircraft,
+    contacts: Sequence[Contact],
+    obs_points: Sequence[Point2],
+    z: float,
+    obs_map: ObstacleMap,
+    scenario: Scenario,
+) -> Optional[float]:
+    """Fast exact scout route energy evaluator for VRPTW search (skips JSON & Waypoint allocations)."""
+    k = len(contacts)
+    if k == 0:
+        return 0.0
+    r = scenario.rules
+    dwell = r.obs_dwell_s
+
+    def _make_win(use_stagger: bool) -> Optional[List[Tuple[float, float]]]:
+        ws: List[Tuple[float, float]] = []
+        for c in contacts:
+            lo, hi = c.window
+            a = lo + WIN_PAD
+            if c.cls == "hostile":
+                if use_stagger:
+                    n_eff = max(1, sum(c.needs.values()))
+                    avail = max(0.0, hi - lo - dwell - r.confirm_margin_s)
+                    eng_buf = min(1.5 + 1.5 * (n_eff - 1), max(HOSTILE_ENG_PAD, 0.05 * avail))
+                else:
+                    eng_buf = HOSTILE_ENG_PAD
+                b = hi - dwell - r.confirm_margin_s - eng_buf
+            else:
+                b = hi - dwell - WIN_PAD
+            if a > b:
+                a = lo + 0.01
+                b = hi - dwell - (r.confirm_margin_s + HOSTILE_ENG_PAD if c.cls == "hostile" else 0.01)
+                if a > b:
+                    return None
+            ws.append((a, b))
+        return ws
+
+    windows = _make_win(True)
+    if windows is None:
+        return None
+
+    home = ac.home
+    v_opt = min(ac.v_h_mps, best_range_speed(ac.power))
+    inv_vh = 1.0 / ac.v_h_mps
+    inv_vup = 1.0 / ac.v_up_mps
+    inv_vdn = 1.0 / ac.v_down_mps
+    inv_vopt = (1.0 / v_opt) if v_opt > 1e-9 else inv_vh
+
+    leg_dhs: List[float] = []
+    leg_min: List[float] = []
+    leg_ideal: List[float] = []
+    sub_dhs_list: List[Optional[List[float]]] = []
+    sub_min_list: List[Optional[List[float]]] = []
+    climb_m = 0.0
+
+    prev_pt: Point3 = home
+    for i in range(k + 1):
+        nxt_pt: Point3 = home if i == k else (obs_points[i][0], obs_points[i][1], z)
+        p3 = obs_map.best_path_3d(prev_pt, nxt_pt, ac, z_cruise=z)
+        if p3 is None:
+            return None
+        if len(p3) == 2:
+            dh = math.hypot(nxt_pt[0] - prev_pt[0], nxt_pt[1] - prev_pt[1])
+            dz = nxt_pt[2] - prev_pt[2]
+            need = dh * inv_vh
+            if dz > 0.0:
+                climb_m += dz
+                t_z = dz * inv_vup
+                if t_z > need:
+                    need = t_z
+            elif dz < 0.0:
+                t_z = -dz * inv_vdn
+                if t_z > need:
+                    need = t_z
+            dt_m = need + TIME_PAD if (dh > 1e-9 or abs(dz) > 1e-9) else 0.0
+            dt_id = dh * inv_vopt
+            if dt_id < dt_m:
+                dt_id = dt_m
+            leg_dhs.append(dh)
+            leg_min.append(dt_m)
+            leg_ideal.append(dt_id)
+            sub_dhs_list.append(None)
+            sub_min_list.append(None)
+        else:
+            sdhs: List[float] = []
+            smins: List[float] = []
+            tdh = 0.0
+            tmin = 0.0
+            for j in range(len(p3) - 1):
+                a3, b3 = p3[j], p3[j + 1]
+                dh = math.hypot(b3[0] - a3[0], b3[1] - a3[1])
+                dz = b3[2] - a3[2]
+                need = dh * inv_vh
+                if dz > 0.0:
+                    climb_m += dz
+                    t_z = dz * inv_vup
+                    if t_z > need:
+                        need = t_z
+                elif dz < 0.0:
+                    t_z = -dz * inv_vdn
+                    if t_z > need:
+                        need = t_z
+                dt_m = need + TIME_PAD if (dh > 1e-9 or abs(dz) > 1e-9) else 0.0
+                sdhs.append(dh)
+                smins.append(dt_m)
+                tdh += dh
+                tmin += dt_m
+            dt_id = tdh * inv_vopt
+            if dt_id < tmin:
+                dt_id = tmin
+            leg_dhs.append(tdh)
+            leg_min.append(tmin)
+            leg_ideal.append(dt_id)
+            sub_dhs_list.append(sdhs)
+            sub_min_list.append(smins)
+        prev_pt = nxt_pt
+
+    timing = optimize_scout_timing(ac, leg_dhs, leg_min, leg_ideal, windows, dwell, scenario.horizon_s)
+    if timing is None:
+        windows_tight = _make_win(False)
+        if windows_tight is None:
+            return None
+        timing = optimize_scout_timing(ac, leg_dhs, leg_min, leg_ideal, windows_tight, dwell, scenario.horizon_s)
+        if timing is None:
+            return None
+    t0, s_times, t_land = timing
+
+    pw = ac.power
+    p0_w = pw.p0_w
+    kv = pw.k_v
+    inv_3600 = 1.0 / 3600.0
+    # Hover dwell energy + total climb energy
+    energy = (k * dwell * p0_w) * inv_3600 + climb_m * pw.e_climb_wh_per_m
+
+    for i in range(k + 1):
+        t_dep = t0 if i == 0 else (s_times[i - 1] + dwell)
+        t_arr = t_land if i == k else s_times[i]
+        dt = t_arr - t_dep
+        if dt <= 1e-9:
+            continue
+        sdhs = sub_dhs_list[i]
+        if sdhs is None:
+            dh = leg_dhs[i]
+            v = dh / dt
+            energy += (p0_w + kv * v * v) * dt * inv_3600
+        else:
+            smins = sub_min_list[i]
+            sub_ts = _allocate_subleg_times(t_dep, dt, sdhs, smins)
+            cur = t_dep
+            for j, st in enumerate(sub_ts):
+                sdt = st - cur
+                if sdt > 1e-9:
+                    v = sdhs[j] / sdt
+                    energy += (p0_w + kv * v * v) * sdt * inv_3600
+                cur = st
+
+    if energy > ac.usable_wh - 1e-3:
+        return None
+    return energy
 
 
 def build_effector_route(

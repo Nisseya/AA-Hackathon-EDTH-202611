@@ -16,7 +16,8 @@ Ce journal trace **chaque itération expérimentale** du solveur dans `fleet-kit
 | V1 | *(pré-git)* | 72.5 | 299.9 | 267.3 | 728.9 | 423.0 | 455.8 | 1664.1 | 1137.9 | **5049.4** | 1.895× | 80.5s (KO) | 8/8 |
 | V2 | *(pré-git)* | 72.5 | 299.9 | 267.3 | 729.1 | 423.0 | 453.0 | 1700.4 | 1186.1 | **5131.3** | 1.926× | 24.5s | 8/8 |
 | V3 | `cb99e45` | 72.5 | 299.3 | 267.3 | 729.1 | 423.0 | 453.0 | 1688.4 | **1244.0** | **5176.7** | **1.943×** | 39.9s | 8/8 |
-| V4 | *(courant)* | 72.5 | **299.9** | 267.3 | 729.1 | 423.0 | **455.8** | 1693.7 | 1217.1 | 5158.3 | 1.936× | 37.1s | 8/8 |
+| V4 | `5a7c489` | 72.5 | **299.9** | 267.3 | 729.1 | 423.0 | **455.8** | 1693.7 | 1217.1 | 5158.3 | 1.936× | 37.1s | 8/8 |
+| **V5** | *(courant)* | **72.5** | **299.9** | **267.3** | **729.1** | **423.0** | **455.8** | 1694.7 | 1223.9 | 5166.1 | 1.939× | **18.98s** | 8/8 |
 
 ---
 
@@ -128,3 +129,40 @@ L'analyse complète de `fleetkit` (`energy.py`, `validator.py`, `scorer.py`, `ge
 - **Deux points à isoler immédiatement par ablation** :
   1. Pourquoi `L4-402` a perdu 26.9 pts entre V3 et V4 ? Hypothèse : soit `stagger_buf` (0.08×avail = jusqu'à 11 s retirées aux fenêtres serrées de L4-402), soit `Tour Merge` qui a consommé du budget CPU dans VND.
   2. Pourquoi `L4-401` prend encore 37 s (vs 24.5 s en V2) ? Hypothèse : `Tour Merge (3b)` + `Or-opt-2` intra-route tournent à CHAQUE passe de VND interne (dans chaque itération ALNS et chaque swap hostile), + `_candidate_empty_scouts` évalue 3 scouts vides au lieu de 1 dans les boucles internes.
+
+---
+
+## Expérience V5 — Profilage `cProfile` & Accélération 2–3× du cœur d'évaluation VRPTW
+
+### Diagnostic `cProfile` sur V4 (L4-401 & L4-402)
+Le profilage détaillé de V4 a révélé que **`eval_scout_tour` représentait 89% du temps sur `L4-401` (17.75 s / 19.93 s)** et **71% sur `L4-402` (17.59 s / 24.84 s)** :
+1. **`optimize_disk_tour` + `_best_point_in_disk` + `point_inside_any` (9.32 s sur L4-401)** : 4.24 M appels à la closure golden-section `f` et 577 K appels à `point_inside_any` vérifiant les 28 cylindres alors que >90% des disques de contacts ne touchent 0 cylindre !
+2. **`best_path_3d` / `shortest_path_2d` non cachés (~8.5 s)** : 51 247 appels redondants à `shortest_path_2d` sur `L4-402` (6.32 M appels à `segment_hits_cyl_2d`).
+3. **`build_scout_route` dans la boucle interne VRPTW (~2 s)** : allouait des dicts JSON, arrondissait et re-parsait `_to_waypoints` à chaque évaluation de mouvement VND/ALNS.
+4. **Tour Merge `3b` exécuté à chaque passe interne de VND** au lieu d'être exécuté uniquement à l'optimum local VND.
+
+### Modifications implémentées (V5)
+1. `geometry3d.py` :
+   - Cache `_disk_blocked_indices(contact, z)` évitant `point_inside_any` quand 0 obstacle n'intersecte le disque.
+   - Cache `_leg_cands_cache` (quantifié à 0.5 m, indépendant de l'aéronef) dans `best_path_3d`.
+   - **`_best_point_in_disk` analytique** : réflexion de Fermat + 1 itération de point fixe exacte (`< 0.01 m`, zéro closure/trigo) quand `da > 1.35 r, db > 1.35 r, un > 0.25`, avec fallback golden-section inliné (10 itérations).
+2. `timing.py` :
+   - Sortie anticipée (early-exit) dans `optimize_scout_timing` dès que l'initialisation Step 3 atteint `ideal_dt` sur toutes les jambes.
+   - **`eval_scout_route_energy`** : évaluateur exact d'énergie scout sans allocation JSON / `_to_waypoints` (parité vérifiée sur 180 tournées L3/L4 : **0 mismatch, écart max = `0.000000 Wh`**).
+   - `stagger_buf` adaptatif `min(1.5 + 1.5*(n_eff-1), max(0.25, 0.05*avail))` avec **fallback automatique à `0.25 s`** si la fenêtre serrée échoue.
+3. `solver.py` :
+   - Câblage de `eval_scout_route_energy` dans `eval_scout_tour` + `n_iters=3` dans `_get_disk_pts` (le final `deconflict.py` garde `n_iters=8` avec le vrai `ac.home`).
+   - Gating de `Or-opt-2` intra-route à `deep or n <= 8`.
+   - Déplacement de **Tour Merge** à l'optimum local VND avec réaffectation exacte `_try_hungarian_scout_match` sur les `k - 1` tournées (permettant à un scout grande batterie déjà occupé d'absorber la fusion pendant qu'un autre récupère son ancienne tournée).
+
+### Résultats V5 (Validation Set)
+- **Total : 5166.1 (+7.8 pts vs V4, 1.939× baseline)**, **8/8 valides** :
+  - `L1-101` : **72.5** (`0.00 s`)
+  - `L2-201` : **299.9** (`0.12 s`)
+  - `L2-202` : **267.3** (`0.19 s`)
+  - `L3-301` : **729.1** (`1.25 s` vs 3.65 s en V4 — **2.9× plus rapide**)
+  - `L3-302` : **423.0** (`0.54 s` vs 0.97 s en V4 — **1.8× plus rapide**)
+  - `L3-303` : **455.8** (`0.76 s` vs 2.27 s en V4 — **3.0× plus rapide**)
+  - `L4-401` : **1694.7** (`18.98 s` vs 37.08 s en V4 — **2.0× plus rapide**, +1.0 pt)
+  - `L4-402` : **1223.9** (`15.97 s` vs 28.32 s en V4 — **1.8× plus rapide**, +6.8 pts)
+- **Temps max divisé par 2** : **18.98 s** (marge de **>41 s** sous la limite de 60 s !). Cela nous libère un énorme budget CPU pour pousser la qualité d'optimisation bien plus loin en V6+.

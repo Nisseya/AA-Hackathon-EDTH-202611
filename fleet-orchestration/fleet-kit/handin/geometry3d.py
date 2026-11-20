@@ -48,6 +48,10 @@ class ObstacleMap:
 
         # Coarse-region cache for 2D detour waypoints (reuses intermediate vertices across nearby endpoints)
         self._path2d_cache: Dict[Tuple[int, int, int, int, int], List[Point2]] = {}
+        # Aircraft-independent 3D candidate polylines cache (quantized to 0.5m)
+        self._leg_cands_cache: Dict[Tuple[int, int, int, int, int, int, int, bool], Optional[List[List[Point3]]]] = {}
+        # Per-(contact_id, z_int) overlapping cylinder indices cache (90%+ of disks touch 0 cylinders!)
+        self._disk_blocked_cache: Dict[Tuple[str, int], List[int]] = {}
 
     def segment_hits_cyl_2d(self, a: Point2, b: Point2, cyl_idx: int, pad: float = OBS_RADIUS_PAD) -> bool:
         cx, cy, r, _ = self.all_cylinders[cyl_idx]
@@ -377,6 +381,22 @@ class ObstacleMap:
             return None
         return clean
 
+    def _disk_blocked_indices(self, contact: Contact, z: float) -> List[int]:
+        key = (contact.id, int(round(z * 10)))
+        res = self._disk_blocked_cache.get(key)
+        if res is None:
+            r_horiz = math.sqrt(max(0.0, self.rules.R_obs_m * self.rules.R_obs_m - z * z))
+            cx0, cy0 = contact.pos[0], contact.pos[1]
+            res = []
+            for i, (cx, cy, rad, top) in enumerate(self.all_cylinders):
+                if z < top + 1e-3:
+                    limit = r_horiz + rad + OBS_RADIUS_PAD + 1.0
+                    dx, dy = cx - cx0, cy - cy0
+                    if dx * dx + dy * dy <= limit * limit:
+                        res.append(i)
+            self._disk_blocked_cache[key] = res
+        return res
+
     def best_path_3d(
         self,
         a: Point3,
@@ -385,16 +405,55 @@ class ObstacleMap:
         z_cruise: Optional[float] = None,
         allow_overflight: bool = True,
     ) -> Optional[List[Point3]]:
-        """Finds the minimum-energy valid 3D polyline from a to b for aircraft ac."""
+        """Finds the minimum-energy valid 3D polyline from a to b for aircraft ac (cached)."""
         r = self.rules
         z_floor = r.z_min_m
         z_mid = z_cruise if z_cruise is not None else max(z_floor, a[2], b[2])
         z_mid = max(z_floor, min(r.z_max_m, z_mid))
 
+        ckey = (
+            int(round(a[0] * 2.0)),
+            int(round(a[1] * 2.0)),
+            int(round(a[2] * 2.0)),
+            int(round(b[0] * 2.0)),
+            int(round(b[1] * 2.0)),
+            int(round(b[2] * 2.0)),
+            int(round(z_mid * 2.0)),
+            allow_overflight,
+        )
+        cached = self._leg_cands_cache.get(ckey)
+        if cached is not None:
+            if not cached:
+                return None
+            # Reuse cached intermediate waypoints with exact endpoints a, b
+            if len(cached) == 1 and len(cached[0]) == 2:
+                return [a, b]
+            candidates = []
+            for c_pts in cached:
+                if len(c_pts) == 2:
+                    if self.segment_valid_3d(a, b):
+                        candidates.append([a, b])
+                else:
+                    cand = [a] + c_pts[1:-1] + [b]
+                    if self.segment_valid_3d(a, cand[1]) and self.segment_valid_3d(cand[-2], b):
+                        candidates.append(cand)
+            if candidates:
+                if len(candidates) == 1:
+                    return candidates[0]
+                best_pts = None
+                best_e = INF
+                for cand in candidates:
+                    e, _ = self._estimate_polyline_energy(cand, ac)
+                    if e < best_e:
+                        best_e = e
+                        best_pts = cand
+                return best_pts
+
         if self.segment_valid_3d(a, b):
+            self._leg_cands_cache[ckey] = [[a, b]]
             return [a, b]
 
-        candidates: List[List[Point3]] = []
+        candidates = []
 
         z_low = min(a[2], b[2], z_mid)
         blocked_2d = self.blocked_indices_at_z(z_low)
@@ -428,8 +487,11 @@ class ObstacleMap:
                 if ov is not None:
                     candidates.append(ov)
 
+        self._leg_cands_cache[ckey] = candidates
         if not candidates:
             return None
+        if len(candidates) == 1:
+            return candidates[0]
 
         best_pts = None
         best_e = INF
@@ -462,8 +524,8 @@ class ObstacleMap:
             cand = target
         else:
             cand = (cx + dx / d * r_horiz, cy + dy / d * r_horiz)
-        blocked = self.blocked_indices_at_z(z)
-        if not self.point_inside_any(cand, blocked, pad=OBS_RADIUS_PAD):
+        blocked = self._disk_blocked_indices(contact, z)
+        if not blocked or not self.point_inside_any(cand, blocked, pad=OBS_RADIUS_PAD):
             return cand
         best = (cx, cy)
         best_d = INF
@@ -495,18 +557,17 @@ class ObstacleMap:
             return []
         r = self.rules
         r_horiz = math.sqrt(max(0.0, r.R_obs_m * r.R_obs_m - z * z)) - 0.25
-        blocked = self.blocked_indices_at_z(z)
 
+        if k == 1:
+            return [self.project_to_obs_disk(home, contacts[0], z)]
+
+        c_blocked = [self._disk_blocked_indices(c, z) for c in contacts]
         pts: List[Point2] = [(c.pos[0], c.pos[1]) for c in contacts]
         for i in range(k):
             prev_p = home if i == 0 else pts[i - 1]
             next_p = home if i == k - 1 else (contacts[i + 1].pos[0], contacts[i + 1].pos[1])
             mid = (0.5 * (prev_p[0] + next_p[0]), 0.5 * (prev_p[1] + next_p[1]))
             pts[i] = self.project_to_obs_disk(mid, contacts[i], z)
-
-        if k == 1:
-            pts[0] = self.project_to_obs_disk(home, contacts[0], z)
-            return pts
 
         for _ in range(n_iters):
             max_move = 0.0
@@ -515,13 +576,14 @@ class ObstacleMap:
                 b = home if i == k - 1 else pts[i + 1]
                 cx, cy = contacts[i].pos[0], contacts[i].pos[1]
                 new_p = _best_point_in_disk(a, b, cx, cy, r_horiz)
-                if blocked and self.point_inside_any(new_p, blocked, pad=OBS_RADIUS_PAD):
+                cb = c_blocked[i]
+                if cb and self.point_inside_any(new_p, cb, pad=OBS_RADIUS_PAD):
                     new_p = self.project_to_obs_disk(new_p, contacts[i], z)
                 move = math.hypot(new_p[0] - pts[i][0], new_p[1] - pts[i][1])
                 if move > max_move:
                     max_move = move
                 pts[i] = new_p
-            if max_move < 0.08:
+            if max_move < 0.15:
                 break
         return pts
 
@@ -549,51 +611,82 @@ class ObstacleMap:
 
 
 def _best_point_in_disk(a: Point2, b: Point2, cx: float, cy: float, r: float) -> Point2:
-    """Minimizes ||p - a|| + ||p - b|| subject to ||p - (cx, cy)|| <= r."""
-    dx, dy = b[0] - a[0], b[1] - a[1]
+    """Minimizes ||p - a|| + ||p - b|| subject to ||p - (cx, cy)|| <= r (fast Fermat reflection)."""
+    ax, ay = a[0], a[1]
+    bx, by = b[0], b[1]
+    dx, dy = bx - ax, by - ay
     l2 = dx * dx + dy * dy
     if l2 < 1e-12:
-        vx, vy = a[0] - cx, a[1] - cy
+        vx, vy = ax - cx, ay - cy
         d = math.hypot(vx, vy)
         if d <= r:
             return a
-        return (cx + vx / d * r, cy + vy / d * r)
-    s = max(0.0, min(1.0, ((cx - a[0]) * dx + (cy - a[1]) * dy) / l2))
-    proj = (a[0] + s * dx, a[1] + s * dy)
-    if (proj[0] - cx) ** 2 + (proj[1] - cy) ** 2 <= r * r:
-        return proj
+        inv = r / d
+        return (cx + vx * inv, cy + vy * inv)
+    s = ((cx - ax) * dx + (cy - ay) * dy) / l2
+    if s < 0.0:
+        s = 0.0
+    elif s > 1.0:
+        s = 1.0
+    px, py = ax + s * dx, ay + s * dy
+    if (px - cx) ** 2 + (py - cy) ** 2 <= r * r:
+        return (px, py)
 
-    ang_a = math.atan2(a[1] - cy, a[0] - cx)
-    ang_b = math.atan2(b[1] - cy, b[0] - cx)
+    # Fast analytic Fermat reflection (exact to <0.01m when both endpoints are well outside disk)
+    vax, vay = ax - cx, ay - cy
+    vbx, vby = bx - cx, by - cy
+    da = math.hypot(vax, vay)
+    db = math.hypot(vbx, vby)
+    if da > 1.35 * r and db > 1.35 * r:
+        ux = vax / da + vbx / db
+        uy = vay / da + vby / db
+        un = math.hypot(ux, uy)
+        if un > 0.25:
+            inv = r / un
+            px, py = cx + ux * inv, cy + uy * inv
+            # One Fermat fixed-point refinement step
+            da1 = math.hypot(ax - px, ay - py)
+            db1 = math.hypot(bx - px, by - py)
+            ux1 = (ax - px) / da1 + (bx - px) / db1
+            uy1 = (ay - py) / da1 + (by - py) / db1
+            un1 = math.hypot(ux1, uy1)
+            if un1 > 1e-6:
+                inv1 = r / un1
+                nx, ny = cx + ux1 * inv1, cy + uy1 * inv1
+                if math.hypot(ax - nx, ay - ny) + math.hypot(bx - nx, by - ny) < da1 + db1:
+                    return (nx, ny)
+            return (px, py)
+
+    # Exact golden-section fallback for near-boundary or nearly-opposite endpoints
+    ang_a = math.atan2(vay, vax)
+    ang_b = math.atan2(vby, vbx)
     diff = (ang_b - ang_a + math.pi) % (2.0 * math.pi) - math.pi
     lo = ang_a
     hi = ang_a + diff
     if lo > hi:
         lo, hi = hi, lo
-
     inv_phi = 0.6180339887498949
     inv_phi2 = 0.3819660112501051
-
-    def f(theta: float) -> float:
-        px = cx + r * math.cos(theta)
-        py = cy + r * math.sin(theta)
-        return math.hypot(px - a[0], py - a[1]) + math.hypot(px - b[0], py - b[1])
-
     x1 = lo + inv_phi2 * (hi - lo)
     x2 = lo + inv_phi * (hi - lo)
-    f1, f2 = f(x1), f(x2)
-    for _ in range(12):
+    p1x, p1y = cx + r * math.cos(x1), cy + r * math.sin(x1)
+    p2x, p2y = cx + r * math.cos(x2), cy + r * math.sin(x2)
+    f1 = math.hypot(p1x - ax, p1y - ay) + math.hypot(p1x - bx, p1y - by)
+    f2 = math.hypot(p2x - ax, p2y - ay) + math.hypot(p2x - bx, p2y - by)
+    for _ in range(10):
         if f1 < f2:
             hi = x2
             x2 = x1
             f2 = f1
             x1 = lo + inv_phi2 * (hi - lo)
-            f1 = f(x1)
+            p1x, p1y = cx + r * math.cos(x1), cy + r * math.sin(x1)
+            f1 = math.hypot(p1x - ax, p1y - ay) + math.hypot(p1x - bx, p1y - by)
         else:
             lo = x1
             x1 = x2
             f1 = f2
             x2 = lo + inv_phi * (hi - lo)
-            f2 = f(x2)
+            p2x, p2y = cx + r * math.cos(x2), cy + r * math.sin(x2)
+            f2 = math.hypot(p2x - ax, p2y - ay) + math.hypot(p2x - bx, p2y - by)
     best_ang = 0.5 * (lo + hi)
     return (cx + r * math.cos(best_ang), cy + r * math.sin(best_ang))

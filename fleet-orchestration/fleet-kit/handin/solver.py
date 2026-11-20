@@ -31,7 +31,7 @@ from deconflict import (
     verify_and_repair_plan,
 )
 from geometry3d import ObstacleMap, Point2
-from timing import build_effector_route, build_scout_route, effector_min_cost
+from timing import build_effector_route, build_scout_route, effector_min_cost, eval_scout_route_energy
 
 
 def _min_e_per_m(ac: Aircraft) -> float:
@@ -198,7 +198,7 @@ class FleetSolver:
         pts = self._disk_cache.get(cids)
         if pts is None:
             contacts = [self.contact_map[cid] for cid in cids]
-            pts = self.obs_map.optimize_disk_tour(self.avg_home, contacts, self.r.z_min_m, n_iters=6)
+            pts = self.obs_map.optimize_disk_tour(self.avg_home, contacts, self.r.z_min_m, n_iters=3)
             self._disk_cache[cids] = pts
         return pts
 
@@ -245,8 +245,7 @@ class FleetSolver:
 
         contacts = [self.contact_map[cid] for cid in cids]
         pts = self._get_disk_pts(cids)
-        built = build_scout_route(ac, contacts, pts, self.r.z_min_m, self.obs_map, self.sc)
-        res = built[1] if built is not None else None
+        res = eval_scout_route_energy(ac, contacts, pts, self.r.z_min_m, self.obs_map, self.sc)
         self._scout_eval_cache[key] = res
         return res
 
@@ -502,13 +501,16 @@ class FleetSolver:
 
         return tours, tour_e, unserved_h
 
-    def _hungarian_scout_match(self, tours: List[List[str]]) -> Tuple[List[List[str]], List[float]]:
-        """Exact globally optimal assignment of non-empty tours to physical scouts."""
-        non_empty = [t for t in tours if t]
+    def _try_hungarian_scout_match(
+        self, non_empty: Sequence[List[str]]
+    ) -> Optional[Tuple[List[List[str]], List[float]]]:
+        """Exact globally optimal assignment of non-empty tours to physical scouts, or None if infeasible."""
         k = len(non_empty)
         m = len(self.scouts)
         if k == 0:
             return [[] for _ in range(m)], [0.0] * m
+        if k > m:
+            return None
 
         mat = []
         for t in non_empty:
@@ -521,14 +523,22 @@ class FleetSolver:
 
         cost, assign = hungarian_min_cost(mat)
         if cost >= INF * 0.25:
-            return tours, [self.eval_scout_tour(self.scouts[i], tuple(tours[i])) or 0.0 for i in range(m)]
+            return None
 
         new_tours = [[] for _ in range(m)]
         new_e = [0.0] * m
         for t_idx, s_idx in enumerate(assign):
-            new_tours[s_idx] = non_empty[t_idx]
+            new_tours[s_idx] = list(non_empty[t_idx])
             new_e[s_idx] = mat[t_idx][s_idx]
         return new_tours, new_e
+
+    def _hungarian_scout_match(self, tours: List[List[str]]) -> Tuple[List[List[str]], List[float]]:
+        """Exact globally optimal assignment of non-empty tours to physical scouts."""
+        res = self._try_hungarian_scout_match([t for t in tours if t])
+        if res is not None:
+            return res
+        m = len(self.scouts)
+        return tours, [self.eval_scout_tour(self.scouts[i], tuple(tours[i])) or 0.0 for i in range(m)]
 
     def _vnd_scout_routes(
         self,
@@ -580,7 +590,7 @@ class FleetSolver:
                             improved = True
                             break
                 n = len(t)
-                if n >= 4:
+                if n >= 4 and (deep or n <= 8):
                     for i in range(n - 1):
                         pair = t[i : i + 2]
                         base = t[:i] + t[i + 2 :]
@@ -730,67 +740,6 @@ class FleetSolver:
                             if changed_pair:
                                 break
 
-            # 3b. Fast Tour Merge (try consolidating two tours onto a single capable scout!)
-            if time.monotonic() < deadline:
-                ne_now = [i for i in range(m) if tours[i]]
-                if len(ne_now) >= 2:
-                    # Try merging smaller tours into larger tours across all physical scouts (incl. big-battery!)
-                    cand_hosts = sorted(range(m), key=lambda idx: (-self.scouts[idx].usable_wh, _min_e_per_m(self.scouts[idx])))[:4]
-                    merged_any = False
-                    for ii in range(len(ne_now)):
-                        if merged_any or time.monotonic() > deadline:
-                            break
-                        a_idx = ne_now[ii]
-                        for jj in range(ii + 1, len(ne_now)):
-                            b_idx = ne_now[jj]
-                            ta, tb = tours[a_idx], tours[b_idx]
-                            if not ta or not tb or len(ta) + len(tb) > 14:
-                                continue
-                            cur_sum = tour_e[a_idx] + tour_e[b_idx]
-                            # Larger tour as base, insert smaller tour's stops greedily
-                            base_t, add_t = (ta, tb) if len(ta) >= len(tb) else (tb, ta)
-                            best_merge = None
-                            for h_idx in cand_hosts:
-                                host_ac = self.scouts[h_idx]
-                                if host_ac.usable_wh < cur_sum * 0.45:
-                                    continue
-                                e_cur = self.eval_scout_tour(host_ac, tuple(base_t))
-                                if e_cur is None:
-                                    continue
-                                cur_t = list(base_t)
-                                ok_m = True
-                                for cid in add_t:
-                                    de, pos = self._best_insertion_in_tour(host_ac, cur_t, e_cur, cid)
-                                    if pos == -1 or e_cur + de >= cur_sum - 1e-4:
-                                        ok_m = False
-                                        break
-                                    cur_t.insert(pos, cid)
-                                    e_cur += de
-                                if ok_m and e_cur < cur_sum - 1e-4:
-                                    if best_merge is None or e_cur < best_merge[0]:
-                                        best_merge = (e_cur, cur_t)
-                            if best_merge is not None:
-                                # Put merged tour into a_idx (Hungarian in step 4 assigns the optimal physical scout!)
-                                # Verify at least one scout (h_idx) can fly it; temporarily assign to a_idx or swap
-                                best_e_m, best_t_m = best_merge
-                                # Find best free or involved scout to hold it right now before Hungarian
-                                holder = None
-                                for cand_h in [a_idx, b_idx] + [k for k in range(m) if not tours[k]]:
-                                    eh = self.eval_scout_tour(self.scouts[cand_h], tuple(best_t_m))
-                                    if eh is not None and eh < cur_sum - 1e-4:
-                                        if holder is None or eh < holder[0]:
-                                            holder = (eh, cand_h)
-                                if holder is not None:
-                                    tours[a_idx] = []
-                                    tour_e[a_idx] = 0.0
-                                    tours[b_idx] = []
-                                    tour_e[b_idx] = 0.0
-                                    tours[holder[1]] = best_t_m
-                                    tour_e[holder[1]] = holder[0]
-                                    improved = True
-                                    merged_any = True
-                                    break
-
             # 4. Exact Hungarian Scout-to-Tour Reassignment
             old_total = sum(tour_e)
             tours, tour_e = self._hungarian_scout_match(tours)
@@ -836,7 +785,56 @@ class FleetSolver:
                         improved = True
 
             if not improved:
-                break
+                # 6. Tour Merge at VND local optimum (uses Hungarian reassignment so occupied big-battery scouts can absorb merged tours!)
+                ne_now = [i for i in range(m) if tours[i]]
+                if len(ne_now) >= 2 and time.monotonic() < deadline:
+                    cand_hosts = sorted(
+                        range(m), key=lambda idx: (-self.scouts[idx].usable_wh, _min_e_per_m(self.scouts[idx]))
+                    )[:4]
+                    cur_total_e = sum(tour_e)
+                    merged_any = False
+                    for ii in range(len(ne_now)):
+                        if merged_any or time.monotonic() > deadline:
+                            break
+                        a_idx = ne_now[ii]
+                        for jj in range(ii + 1, len(ne_now)):
+                            b_idx = ne_now[jj]
+                            ta, tb = tours[a_idx], tours[b_idx]
+                            if not ta or not tb or len(ta) + len(tb) > 14:
+                                continue
+                            cur_sum = tour_e[a_idx] + tour_e[b_idx]
+                            base_t, add_t = (ta, tb) if len(ta) >= len(tb) else (tb, ta)
+                            best_merge = None
+                            for h_idx in cand_hosts:
+                                host_ac = self.scouts[h_idx]
+                                if host_ac.usable_wh < cur_sum * 0.45:
+                                    continue
+                                e_cur = self.eval_scout_tour(host_ac, tuple(base_t))
+                                if e_cur is None:
+                                    continue
+                                cur_t = list(base_t)
+                                ok_m = True
+                                for cid in add_t:
+                                    de, pos = self._best_insertion_in_tour(host_ac, cur_t, e_cur, cid)
+                                    if pos == -1 or e_cur + de >= cur_sum - 1e-4:
+                                        ok_m = False
+                                        break
+                                    cur_t.insert(pos, cid)
+                                    e_cur += de
+                                if ok_m and e_cur < cur_sum - 1e-4:
+                                    if best_merge is None or e_cur < best_merge[0]:
+                                        best_merge = (e_cur, cur_t, h_idx)
+                            if best_merge is not None:
+                                _, best_t_m, _ = best_merge
+                                cand_list = [tours[k] for k in ne_now if k != a_idx and k != b_idx] + [best_t_m]
+                                matched = self._try_hungarian_scout_match(cand_list)
+                                if matched is not None and sum(matched[1]) < cur_total_e - 1e-4:
+                                    tours, tour_e = matched
+                                    improved = True
+                                    merged_any = True
+                                    break
+                if not improved:
+                    break
 
         return tours, tour_e
 
