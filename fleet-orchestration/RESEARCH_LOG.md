@@ -21,7 +21,7 @@ Ce journal trace **chaque itération expérimentale** du solveur dans `fleet-kit
 | V6 | `a07c6d2` | **72.5** | **299.9** | **267.3** | **729.1** | **423.0** | **455.8** | **1708.0** | 1239.5 | 5195.1 | 1.950× | 30.37s | 8/8 |
 | V7 | `1d5b54c` | **72.5** | **299.9** | **267.3** | **729.1** | **423.0** | **455.8** | 1707.8 | **1258.8** | **5214.2** | **1.957×** | 29.12s | 8/8 |
 | V8 | `f93ddd6` | **72.5** | **299.9** | **267.3** | **729.1** | **423.0** | **455.8** | 1707.8 | 1258.8 | 5214.2 | 1.957× | 24.54s | 8/8 |
-| **V9** | *(courant)* | **72.5** | **299.9** | **267.3** | **729.1** | **423.0** | **455.8** | **1717.7** | **1261.0** | **5226.3** | **1.961×** | 32.87s | 8/8 |
+| **V9** | `168a555` | **72.5** | **299.9** | **267.3** | **729.1** | **423.0** | **455.8** | **1717.7** | **1261.0** | **5226.3** | **1.961×** | 32.87s | 8/8 |
 
 ---
 
@@ -278,7 +278,7 @@ L'instrumentation de `deconflict_and_build_plan` a révélé deux goulots d'étr
 ## Expérience V9 — Launch-Urgency Tiering + Pad-Spread Hungarian + Multi-Blocker Relocation + Garde `ac_is_free`
 
 ### Diagnostics effectués sur V8 (12 scénarios L4 : `L4-401, L4-402, L4-00..09`)
-L'audit complet pré/post-déconfliction a montré que **11/12 scénarios L4 avaient déjà `drop = 0`** (perte médiane  sur , soit **99.75% d'efficacité**), mais les 3 scénarios perdant  (`L4-401: -12.8`, `L4-06: -17.4`, `L4-02: -73.6`) partageaient **exactement la même cause géométrique racine** :
+L'audit complet pré/post-déconfliction a montré que **11/12 scénarios L4 avaient déjà `drop = 0`** (perte médiane `3.6 pts` sur `1450+`, soit **99.75% d'efficacité**), mais les 3 scénarios perdant `> 10 pts` (`L4-401: -12.8`, `L4-06: -17.4`, `L4-02: -73.6`) partageaient **exactement la même cause géométrique racine** :
 1. **Saturation de la grille de pads `100 m × 100 m` sous `d_sep = 50 m`** : les 15 scouts sont espacés de `11.1 m`. `optimize_scout_timing` faisait décoller par défaut à `t0 = 0.0 s` même les scouts ayant `> 10 s` de slack au décollage (pour économiser `0.05 Wh`). Placés avant un scout réellement verrouillé à `t0 = 0.0 s` (`max_t0 < 2 s`), ils le forçaient au split (`-12.5` à `-17.2 pts`) ou à l'abandon de contact (`C25`, `95 pts`).
 2. **Double blocage simultané** : sur `L4-06`, `S04` était bloqué par **deux** voisins à `11 m` (`S07` et `S08`), faisant échouer la relocalisation 1-bloqueur.
 3. **Bug latent `unplaced_scouts` détecté sur les 40 seeds inédits** : quand `≥ 2` scouts échouaient et que le premier réutilisait l'aéronef du second avant son tour, le second pouvait écraser/retirer son propre aéronef dans `sep.routes_json` (`KeyError`).
@@ -307,3 +307,28 @@ L'audit complet pré/post-déconfliction a montré que **11/12 scénarios L4 ava
   - **`L4-02`** gagne encore `+27.0 pts` (`1378.6 → 1405.6`, soit `+130 pts` par rapport à V7 !).
   - **`L4-07`** gagne `+3.8 pts` (`1442.4 → 1446.2`).
   - **40/40 valides**, zéro crash, temps max `43.66 s` sous contention 6-cœurs (`32.87 s` en single-core).
+
+---
+
+## Vérification Finale Officielle (`check_handin.py` & Plans de Validation)
+
+### 1. Harnais officiel sandboxé (`python3 handin/check_handin.py --levels L1,L2,L3,L4 --seeds 0-4 --timeout 60`)
+- **Résultat : `total 12008.9 | baseline 5998.5 | ratio 2.002× | failed runs 0` (20/20 `ok`, max `45.1 s`)**
+- Détail L4 en single-core sandboxé :
+  - `L4-0` : **1505.8** vs `590.3` (`2.55×`, `15.5 s`)
+  - `L4-1` : **1520.5** vs `432.5` (`3.52×`, `41.2 s`)
+  - `L4-2` : **1435.5** vs `331.5` (**`4.33×`**, `45.1 s`)
+  - `L4-3` : **1301.7** vs `532.9` (`2.44×`, `35.3 s`)
+  - `L4-4` : **1455.3** vs `453.5` (`3.21×`, `26.8 s`)
+  - **Sous-total L4 (`seeds 0–4`) : `7218.8` vs `2340.7` (`3.084×` baseline)**
+
+### 2. Plans de validation générés & vérifiés (`fleet-kit/plans/`)
+Générés via `python3 handin/planner.py` et validés via `python3 -m fleetkit score` (**total exact : `5226.31`**, prêts pour `python3 -m fleetkit submit-all plans/`) :
+- `L1-101.json` : **72.45** (`110.0 pts`, `15.1 Wh`, `3 eff`)
+- `L2-201.json` : **299.87** (`394.0 pts`, `48.3 Wh`, `7 eff`)
+- `L2-202.json` : **267.32** (`355.0 pts`, `55.4 Wh`, `6 eff`)
+- `L3-301.json` : **729.14** (`1007.0 pts`, `175.7 Wh`, `19 eff`)
+- `L3-302.json` : **423.04** (`681.0 pts`, `155.9 Wh`, `18 eff`)
+- `L3-303.json` : **455.76** (`746.0 pts`, `160.5 Wh`, `21 eff`)
+- `L4-401.json` : **1717.73** (`2678.0 pts`, `760.5 Wh`, `58 eff`)
+- `L4-402.json` : **1261.00** (`2260.0 pts`, `878.0 Wh`, `56 eff`)
