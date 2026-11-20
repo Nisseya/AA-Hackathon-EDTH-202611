@@ -613,14 +613,50 @@ def place_effector_group_deconflicted(
                     if found_eff is not None:
                         break
 
-            # Tier 3: altitude layers (early climb clears low-altitude launch/landing corridor!)
+            # Tier 2b: Lateral Approach Fan-Out at z_min (solves 0-slack multi-effector convergence for ~0.05 Wh!)
             if found_eff is None:
-                for zc in z_levels[1:]:
-                    for extra_d in (0.0, 6.0):
-                        for ta in cand_arrs[:8]:
+                for lat_off in (75.0, -75.0, 115.0, -115.0):
+                    for extra_d in (0.0, 4.0):
+                        for ta in cand_arrs[:6]:
                             built = build_effector_route(
                                 eff, contact, ta, obs_map, scenario,
-                                z_cruise=zc, extra_duration=extra_d,
+                                z_cruise=r.z_min_m, extra_duration=extra_d, approach_lat=lat_off,
+                            )
+                            if built is None:
+                                continue
+                            wps, en, _ = built
+                            if sep_index.first_conflict(eff.id, wps) is None:
+                                found_eff = (wps, en, ta)
+                                break
+                        if found_eff is not None:
+                            break
+                    if found_eff is not None:
+                        break
+
+            # Tier 2c: Cheap local 3D dodge at z0 BEFORE expensive high-altitude climbs!
+            if found_eff is None:
+                for ed in (2.0, 6.0):
+                    for ta in cand_arrs[:4]:
+                        built = build_effector_route(
+                            eff, contact, ta, obs_map, scenario, z_cruise=z0, extra_duration=ed
+                        )
+                        if built is None:
+                            continue
+                        dodged = _try_dodge_chain(built[0], eff, obs_map, scenario, sep_index, max_dodges=3)
+                        if dodged is not None:
+                            found_eff = (dodged[0], dodged[1], ta)
+                            break
+                    if found_eff is not None:
+                        break
+
+            # Tier 3: altitude layers (with optional lateral fan-out for tight convergence!)
+            if found_eff is None:
+                for zc in z_levels[1:]:
+                    for lat_off, extra_d in ((0.0, 0.0), (0.0, 6.0), (75.0, 0.0), (-75.0, 0.0)):
+                        for ta in cand_arrs[:6]:
+                            built = build_effector_route(
+                                eff, contact, ta, obs_map, scenario,
+                                z_cruise=zc, extra_duration=extra_d, approach_lat=lat_off,
                             )
                             if built is None:
                                 continue
@@ -634,9 +670,9 @@ def place_effector_group_deconflicted(
                     if found_eff is not None:
                         break
 
-            # Tier 4: local 3D dodge chain WITH slack (extra_duration > 0 so dodge waypoints are feasible!)
+            # Tier 4: deeper local 3D dodge chain across altitudes & extra_duration
             if found_eff is None:
-                for zc, ed in ((z0, 6.0), (z0, 14.0), (r.z_min_m, 6.0), (71.0, 6.0)):
+                for zc, ed in ((z0, 14.0), (r.z_min_m, 6.0), (71.0, 6.0), (112.0, 6.0)):
                     for ta in cand_arrs[:4]:
                         built = build_effector_route(
                             eff, contact, ta, obs_map, scenario, z_cruise=zc, extra_duration=ed

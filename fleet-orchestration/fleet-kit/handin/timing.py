@@ -533,6 +533,7 @@ def build_effector_route(
     z_cruise: float = 0.0,
     angle_deg: float = 0.0,
     extra_duration: float = 0.0,
+    approach_lat: float = 0.0,
 ) -> Optional[Tuple[List[dict], float, float]]:
     """Builds a valid minimum-energy effector route arriving at `arrive_t`."""
     r = scenario.rules
@@ -543,7 +544,27 @@ def build_effector_route(
     e_z = 0.0
     e_pt = obs_map.engage_point(ac.home[:2], contact, z=e_z, angle_deg=angle_deg)
 
-    if z_cruise <= 1e-3:
+    if abs(approach_lat) > 1e-3:
+        vx, vy = e_pt[0] - ac.home[0], e_pt[1] - ac.home[1]
+        d = math.hypot(vx, vy)
+        back_dist = 105.0
+        if d < back_dist + 55.0:
+            return None
+        ux, uy = vx / d, vy / d
+        nx, ny = -uy, ux
+        za = max(r.z_min_m, min(r.z_max_m, z_cruise if z_cruise > 1e-3 else r.z_min_m))
+        app_pt: Point3 = (
+            e_pt[0] - ux * back_dist + nx * approach_lat,
+            e_pt[1] - uy * back_dist + ny * approach_lat,
+            za,
+        )
+        if not obs_map.segment_valid_3d(app_pt, e_pt):
+            return None
+        p1 = obs_map.best_path_3d(ac.home, app_pt, ac, z_cruise=za)
+        if p1 is None:
+            return None
+        pts3 = p1 + [e_pt]
+    elif z_cruise <= 1e-3:
         pts3 = obs_map.best_path_3d(ac.home, e_pt, ac, z_cruise=r.z_min_m)
     else:
         zc = max(r.z_min_m, min(r.z_max_m, z_cruise))

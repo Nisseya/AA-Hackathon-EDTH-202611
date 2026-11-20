@@ -1157,17 +1157,89 @@ class FleetSolver:
             if placed_ok:
                 continue
 
-            # Try smart tour split across (ac, idle_ac) or (idle1, idle2) over all split points!
+            # 2-way & 3-way Physical Scout Swap Rescue (fixes pinned t0=0 scouts on adjacent pads <50m apart!)
+            # Swap `cids` onto an already-placed scout `other_ac` (whose pad is far away / later t0),
+            # and move `other_ac`'s tour onto `ac` or an idle scout!
+            if placed_scout_tours and time.monotonic() < deadline:
+                swap_cands = []
+                for oid, ocids in placed_scout_tours.items():
+                    oac = self.aircraft_map[oid]
+                    e_new_me = self.eval_scout_tour(oac, tuple(cids))
+                    if e_new_me is None:
+                        continue
+                    # Prioritize placed scouts whose pad is far from ac's pad or that launch later
+                    t0_other = sep.routes_json[oid][0]["t"] if oid in sep.routes_json and sep.routes_json[oid] else 0.0
+                    pad_d = hdist(oac.home, ac.home)
+                    swap_cands.append((-t0_other, -pad_d, e_new_me, oid, ocids))
+                swap_cands.sort()
+                for _, _, _, oid, ocids in swap_cands[:10]:
+                    if time.monotonic() > deadline:
+                        break
+                    oac = self.aircraft_map[oid]
+                    old_owps = sep.routes_json[oid]
+                    # Candidate hosts for `ocids`: original `ac` plus feasible idle scouts
+                    alt_hosts = []
+                    for ha in [ac] + [ia for ia in idle_scouts if ia.id != ac.id]:
+                        eh = self.eval_scout_tour(ha, tuple(ocids))
+                        if eh is not None:
+                            alt_hosts.append((eh, ha))
+                    if not alt_hosts:
+                        continue
+                    alt_hosts.sort(key=lambda x: x[0])
+                    sep.remove(oid)
+                    res_new_me = place_scout_deconflicted(
+                        oac, contacts, self.obs_map, self.sc, sep, preferred_z=self.r.z_min_m
+                    )
+                    if res_new_me is not None:
+                        sep.add(oac.id, res_new_me[0])
+                        ocontacts = [self.contact_map[x] for x in ocids]
+                        moved_other = None
+                        for _, ha in alt_hosts[:4]:
+                            r_h = place_scout_deconflicted(
+                                ha, ocontacts, self.obs_map, self.sc, sep, preferred_z=self.r.z_min_m
+                            )
+                            if r_h is not None:
+                                moved_other = (ha, r_h)
+                                break
+                        if moved_other is not None:
+                            ha, r_h = moved_other
+                            sep.add(ha.id, r_h[0])
+                            obs_end_by_cid.update(res_new_me[2])
+                            obs_end_by_cid.update(r_h[2])
+                            placed_scout_tours[oac.id] = cids
+                            placed_scout_tours[ha.id] = ocids
+                            scout_headroom[oac.id] = oac.usable_wh - res_new_me[1]
+                            scout_headroom[ha.id] = ha.usable_wh - r_h[1]
+                            placed_ok = True
+                            break
+                        else:
+                            sep.remove(oac.id)
+                            sep.add(oid, old_owps)
+                    else:
+                        sep.add(oid, old_owps)
+            if placed_ok:
+                continue
+
+            # Try smart tour split across diverse (ac, idle_ac) or (idle1, idle2) over all split points!
             if len(cids) >= 2 and idle_scouts:
-                # Candidate pairs of scouts: prioritize keeping original ac + best/largest-battery idle scouts
                 other_idles = [a for a in idle_scouts if a.id != ac.id]
-                other_idles.sort(key=lambda a: (-a.usable_wh, _min_e_per_m(a)))
+                # Diverse idle pool: largest battery + fastest + farthest pad from ac!
+                pick_idles: List[Aircraft] = []
+                for key_fn in (
+                    lambda a: (-a.usable_wh, _min_e_per_m(a)),
+                    lambda a: (-a.v_h_mps, -a.usable_wh),
+                    lambda a: (-hdist(a.home, ac.home), -a.usable_wh),
+                ):
+                    for cand_i in sorted(other_idles, key=key_fn)[:2]:
+                        if cand_i not in pick_idles:
+                            pick_idles.append(cand_i)
                 scout_pairs: List[Tuple[Aircraft, Aircraft]] = []
-                for oi in other_idles[:3]:
+                for oi in pick_idles[:4]:
                     scout_pairs.append((ac, oi))
                     scout_pairs.append((oi, ac))
-                if len(other_idles) >= 2:
-                    scout_pairs.append((other_idles[0], other_idles[1]))
+                if len(pick_idles) >= 2:
+                    scout_pairs.append((pick_idles[0], pick_idles[1]))
+                    scout_pairs.append((pick_idles[1], pick_idles[0]))
 
                 best_split = None
                 for mid in range(1, len(cids)):

@@ -427,7 +427,8 @@ class ObstacleMap:
                 return None
             # Reuse cached intermediate waypoints with exact endpoints a, b
             if len(cached) == 1 and len(cached[0]) == 2:
-                return [a, b]
+                if self.segment_valid_3d(a, b):
+                    return [a, b]
             candidates = []
             for c_pts in cached:
                 if len(c_pts) == 2:

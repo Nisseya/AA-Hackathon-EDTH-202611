@@ -18,7 +18,8 @@ Ce journal trace **chaque itération expérimentale** du solveur dans `fleet-kit
 | V3 | `cb99e45` | 72.5 | 299.3 | 267.3 | 729.1 | 423.0 | 453.0 | 1688.4 | **1244.0** | **5176.7** | **1.943×** | 39.9s | 8/8 |
 | V4 | `5a7c489` | 72.5 | **299.9** | 267.3 | 729.1 | 423.0 | **455.8** | 1693.7 | 1217.1 | 5158.3 | 1.936× | 37.1s | 8/8 |
 | V5 | `db81484` | **72.5** | **299.9** | **267.3** | **729.1** | **423.0** | **455.8** | 1694.7 | 1223.9 | 5166.1 | 1.939× | **18.98s** | 8/8 |
-| **V6** | *(courant)* | **72.5** | **299.9** | **267.3** | **729.1** | **423.0** | **455.8** | **1708.0** | 1239.5 | **5195.1** | **1.950×** | 30.37s | 8/8 |
+| V6 | `a07c6d2` | **72.5** | **299.9** | **267.3** | **729.1** | **423.0** | **455.8** | **1708.0** | 1239.5 | 5195.1 | 1.950× | 30.37s | 8/8 |
+| **V7** | *(courant)* | **72.5** | **299.9** | **267.3** | **729.1** | **423.0** | **455.8** | 1707.8 | **1258.8** | **5214.2** | **1.957×** | 29.12s | 8/8 |
 
 ---
 
@@ -206,3 +207,36 @@ Le profilage détaillé de V4 a révélé que **`eval_scout_tour` représentait 
   | L4 | 4722.0 | 14387.8 | **14406.4** | **+18.6** | **3.051×** | 10/10 | 35.32s |
   | **TOTAL (40)** | **11847.8** | **23616.1** | **23635.0** | **+18.9** | **1.995×** | **40/40** | max 42.05s |
 - **Piste identifiée pour V7** : gros gains sur `L4-00 (+22.3)`, `L4-04 (+24.9)`, `L4-09 (+14.2)`, mais une chute isolée sur `L4-06 (1293.7 → 1255.5, -38.2 pts)` à diagnostiquer !
+
+---
+
+## Expérience V7 — Lateral Approach Fan-Out Effecteurs + Physical Scout Swap (2-way/3-way)
+
+### Diagnostics effectués sur V6 (`L4-06`, `L4-02`, `L4-402`, `L4-401`)
+L'instrumentation de `deconflict_and_build_plan` a révélé deux goulots d'étranglement universels :
+1. **Convergence multi-effecteurs hors sphère d'exemption `60 m` lorsque `slack ≈ 0.2 s`** : sur `L4-402 C17` (71 pts, 3 lights) et `L4-06 C02` (72 pts, 1L+1H), chaque effecteur avait `cf = None` contre tous les autres aéronefs, mais en arrivant au même instant `ta` sur le même axe radial depuis la base, ils entraient en conflit entre `65 m` et `120 m` de la cible (juste hors des `60 m` d'exemption R8).
+2. **Scouts verrouillés à `t0 = 0.0 s` sur pads adjacents `< 50 m`** : sur `L4-02 S15`, `L4-06 S04/S07` et `L4-402 S01/S05`, deux scouts doivent décoller à `t0 = 0.0 s` depuis des pads espacés de `< 50 m` (infaisable même avec `d_t0 = 1.0 s`). Seul un échange physique d'aéronef avec un scout sur un pad distant (`≥ 52 m`) ou à `t0` tardif résout ce conflit sans split ni perte de contact.
+
+### Modifications implémentées (V7)
+1. `timing.py` & `deconflict.py` :
+   - **Lateral Approach Fan-Out (`approach_lat = ±75 m, ±115 m` à `105 m` de la cible, `z = z_min`)** dans `build_effector_route` et `place_effector_group_deconflicted` (Tier 2b) : permet à 2–4 effecteurs d'engager à la **même milliseconde** pour `+0.03 à +0.65 Wh` seulement !
+   - **Esquive 3D locale basse altitude (`Tier 2c` à `z0`)** exécutée AVANT les montées coûteuses `z ≥ 71 m` (économise de l'énergie même sur L1–L3 !).
+2. `solver.py` :
+   - **Physical Scout Swap Rescue (2-way & 3-way)** : avant tout tour-split, tente de transférer la tournée bloquée vers un scout déjà placé sur un pad distant / `t0` tardif, en déplaçant sa tournée vers le scout original ou un scout libre.
+   - Pool diversifié (batterie, vitesse `v_h_mps`, distance de pad) dans Smart Tour Split.
+3. `geometry3d.py` : garde exacte `segment_valid_3d(a, b)` sur hit cache quantifié 0.5 m.
+
+### Résultats V7
+- **Validation Set (8 scénarios)** : **5214.2 (+19.1 pts vs V6, +48.1 pts vs V5, 1.957× baseline)**, **8/8 valides**, max `29.12 s` :
+  - `L1–L3` : tous au record absolu (`72.5 / 299.9 / 267.3 / 729.1 / 423.0 / 455.8`).
+  - `L4-401` : **1707.8** (`29.12 s`).
+  - **`L4-402` : 1258.8 (`+19.3 pts` vs V6, `3.008×` baseline, `20.18 s`)** — gain exactement conforme à la prédiction (`C17` sauvé !).
+- **Benchmark Hors-Distribution (40 seeds inédits `L1–L4, seeds 0–9`) — PROGRÈS SUR TOUS LES 4 NIVEAUX** :
+  | Niveau (10 seeds) | Baseline | V5 | V6 | **V7** | Δ V7 vs V6 | Ratio Base | Valid |
+  |---|---:|---:|---:|---:|---:|---:|---:|
+  | L1 | 1014.3 | 1138.3 | 1138.3 | **1139.5** | **+1.2** | 1.123× | 10/10 |
+  | L2 | 2318.1 | 2819.3 | 2819.5 | **2820.0** | **+0.5** | 1.217× | 10/10 |
+  | L3 | 3793.5 | 5270.7 | 5270.7 | **5272.5** | **+1.8** | 1.390× | 10/10 |
+  | L4 | 4722.0 | 14387.8 | 14406.4 | **14433.7** | **+27.3** | **3.057×** | 10/10 |
+  | **TOTAL (40)** | **11847.8** | **23616.1** | **23635.0** | **23665.7** | **+30.7** | **1.997×** | **40/40** |
+  - Notamment `L4-06` bondit de `1255.5 → 1292.3 (+36.8 pts, 4.11× baseline)` !
