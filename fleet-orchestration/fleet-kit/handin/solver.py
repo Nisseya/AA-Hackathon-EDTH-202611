@@ -428,6 +428,14 @@ class FleetSolver:
                                 b2_de = b1_de
                                 b1_de, b1_s, b1_p = de, s_idx, pos
                     if b1_s == -1:
+                        if len(active_scouts) < m:
+                            matched_h = self._try_hungarian_scout_match([tours[i] for i in active_scouts] + [[cid]])
+                            if matched_h is not None:
+                                tours, tour_e = matched_h
+                                remaining_h.remove(cid)
+                                ins_cache.clear()
+                                best_pick = "__HUNGARIAN_DONE__"
+                                break
                         infeas_now.append(cid)
                         continue
                 regret = (b2_de - b1_de) if b2_de < INF * 0.5 else (15.0 + hostile_priority.get(cid, 50.0) * 0.1)
@@ -441,9 +449,12 @@ class FleetSolver:
                     best_target = (b1_s, b1_p, b1_de)
 
             for cid in infeas_now:
-                remaining_h.remove(cid)
-                unserved_h.add(cid)
+                if cid in remaining_h:
+                    remaining_h.remove(cid)
+                    unserved_h.add(cid)
 
+            if best_pick == "__HUNGARIAN_DONE__":
+                continue
             if best_pick is None:
                 break
 
@@ -489,6 +500,30 @@ class FleetSolver:
                         best_profit = profit
                         best_u = cid
                         best_u_target = (b_s, b_p, b_de)
+
+            # Check if Hungarian scout reassignment unlocks a profitable far-away unknown onto a big-battery scout!
+            best_hung_u = None
+            if len(active_scouts) < m and time.monotonic() < deadline:
+                cur_tot_e = sum(tour_e)
+                ne_tours = [tours[i] for i in active_scouts]
+                for cid in remaining_u:
+                    pts_u = self.contact_map[cid].points
+                    if pts_u - lam * self.solo_scout_e.get(cid, INF) <= best_profit:
+                        continue
+                    matched_u = self._try_hungarian_scout_match(ne_tours + [[cid]])
+                    if matched_u is not None:
+                        de_h = sum(matched_u[1]) - cur_tot_e
+                        prof_h = pts_u - lam * de_h
+                        if prof_h > best_profit:
+                            best_profit = prof_h
+                            best_hung_u = (cid, matched_u)
+
+            if best_hung_u is not None:
+                cid_h, (nt_h, ne_h) = best_hung_u
+                tours, tour_e = nt_h, ne_h
+                remaining_u.remove(cid_h)
+                ins_u.clear()
+                continue
 
             if best_u is None:
                 break
@@ -777,7 +812,20 @@ class FleetSolver:
                             if prof > best_profit:
                                 best_profit = prof
                                 best_ins = (s_idx, pos, de)
-                    if best_ins is not None:
+                    best_hung = None
+                    ne_now_u = [t for t in tours if t]
+                    if len(ne_now_u) < m and pts_u - lam * self.solo_scout_e.get(cid, INF) > best_profit:
+                        matched_u = self._try_hungarian_scout_match(ne_now_u + [[cid]])
+                        if matched_u is not None:
+                            prof_h = pts_u - lam * (sum(matched_u[1]) - sum(tour_e))
+                            if prof_h > best_profit:
+                                best_profit = prof_h
+                                best_hung = matched_u
+                    if best_hung is not None:
+                        tours, tour_e = best_hung
+                        served_set.add(cid)
+                        improved = True
+                    elif best_ins is not None:
                         s_idx, pos, de = best_ins
                         tours[s_idx].insert(pos, cid)
                         tour_e[s_idx] += de
@@ -1031,42 +1079,55 @@ class FleetSolver:
                 placed_scout_tours[ac.id] = cids
                 scout_headroom[ac.id] = ac.usable_wh - en
             else:
-                # Rip-up & Re-order rescue: if conflict is with a roomier scout, swap placement order!
+                # Unconditional Rip-up & Re-order rescue (1 or 2 conflicting scouts — handles time-slack vs battery-headroom!)
                 ripped_ok = False
                 obs_pts = self.obs_map.optimize_disk_tour(ac.home[:2], contacts, self.r.z_min_m)
                 nom = build_scout_route(ac, contacts, obs_pts, self.r.z_min_m, self.obs_map, self.sc)
                 if nom is not None:
-                    cf = sep.first_conflict(ac.id, nom[0])
-                    if cf is not None and cf[0] in placed_scout_tours:
-                        other_id = cf[0]
-                        my_hr = ac.usable_wh - nom[1]
-                        if scout_headroom.get(other_id, 0.0) > my_hr + 1.0:
-                            old_other_wps = sep.routes_json[other_id]
-                            old_other_cids = placed_scout_tours[other_id]
-                            sep.remove(other_id)
-                            res_me = place_scout_deconflicted(
-                                ac, contacts, self.obs_map, self.sc, sep, preferred_z=self.r.z_min_m
-                            )
-                            if res_me is not None:
-                                sep.add(ac.id, res_me[0])
-                                res_other = place_scout_deconflicted(
-                                    self.aircraft_map[other_id],
-                                    [self.contact_map[x] for x in old_other_cids],
+                    ripped_ids: List[str] = []
+                    saved_wps: Dict[str, List[dict]] = {}
+                    for _ in range(2):
+                        cf = sep.first_conflict(ac.id, nom[0])
+                        if cf is None or cf[0] not in placed_scout_tours or cf[0] in saved_wps:
+                            break
+                        oid = cf[0]
+                        ripped_ids.append(oid)
+                        saved_wps[oid] = sep.routes_json[oid]
+                        sep.remove(oid)
+                        res_me = place_scout_deconflicted(
+                            ac, contacts, self.obs_map, self.sc, sep, preferred_z=self.r.z_min_m
+                        )
+                        if res_me is not None:
+                            sep.add(ac.id, res_me[0])
+                            re_placed: List[Tuple[str, Tuple[List[dict], float, Dict[str, float]]]] = []
+                            all_back = True
+                            for rid in ripped_ids:
+                                r_res = place_scout_deconflicted(
+                                    self.aircraft_map[rid],
+                                    [self.contact_map[x] for x in placed_scout_tours[rid]],
                                     self.obs_map, self.sc, sep, preferred_z=self.r.z_min_m,
                                 )
-                                if res_other is not None:
-                                    sep.add(other_id, res_other[0])
-                                    obs_end_by_cid.update(res_me[2])
-                                    obs_end_by_cid.update(res_other[2])
-                                    placed_scout_tours[ac.id] = cids
-                                    scout_headroom[ac.id] = ac.usable_wh - res_me[1]
-                                    scout_headroom[other_id] = self.aircraft_map[other_id].usable_wh - res_other[1]
-                                    ripped_ok = True
-                                else:
-                                    sep.remove(ac.id)
-                                    sep.add(other_id, old_other_wps)
+                                if r_res is None:
+                                    all_back = False
+                                    break
+                                sep.add(rid, r_res[0])
+                                re_placed.append((rid, r_res))
+                            if all_back:
+                                obs_end_by_cid.update(res_me[2])
+                                placed_scout_tours[ac.id] = cids
+                                scout_headroom[ac.id] = ac.usable_wh - res_me[1]
+                                for rid, r_res in re_placed:
+                                    obs_end_by_cid.update(r_res[2])
+                                    scout_headroom[rid] = self.aircraft_map[rid].usable_wh - r_res[1]
+                                ripped_ok = True
+                                break
                             else:
-                                sep.add(other_id, old_other_wps)
+                                sep.remove(ac.id)
+                                for rid, _ in re_placed:
+                                    sep.remove(rid)
+                    if not ripped_ok:
+                        for rid, owps in saved_wps.items():
+                            sep.add(rid, owps)
                 if not ripped_ok:
                     unplaced_scouts.append((s_idx, cids))
 
@@ -1479,12 +1540,19 @@ class FleetSolver:
                     me += sum(rc_h[:nh]) if len(rc_h) >= nh else INF
                 m_eff[c.id] = me
 
-                best_de = self.solo_scout_e[c.id]
+                best_de = INF
                 for s_idx in eval_scouts:
                     de, _ = self._best_insertion_in_tour(self.scouts[s_idx], tours[s_idx], tour_e[s_idx], c.id)
                     if de < best_de:
                         best_de = de
-                m_scout[c.id] = best_de
+                ne_m = [t for t in tours if t]
+                if len(ne_m) < m and best_de > self.solo_scout_e[c.id] + 2.0:
+                    mh = self._try_hungarian_scout_match(ne_m + [[c.id]])
+                    if mh is not None:
+                        de_h = sum(mh[1]) - sum(tour_e)
+                        if de_h < best_de:
+                            best_de = de_h
+                m_scout[c.id] = best_de if best_de < INF * 0.5 else self.solo_scout_e[c.id]
 
         return m_scout, m_eff
 
@@ -1748,7 +1816,7 @@ class FleetSolver:
 
         # Stage 4: Deep ALNS + deep VND polish on the top-1 solution's scout routes
         if top_sols and time.monotonic() < search_deadline:
-            deep_iters = 45 if n_h <= 15 else 35
+            deep_iters = 55 if n_h <= 15 else 45
             polished = self.evaluate_subset(
                 top_sols[0]["hostiles"], search_deadline,
                 alns_iters=deep_iters, rng=rng, seed_tours=top_sols[0]["tours"], deep_vnd=True,

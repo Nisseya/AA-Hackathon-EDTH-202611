@@ -17,7 +17,8 @@ Ce journal trace **chaque itération expérimentale** du solveur dans `fleet-kit
 | V2 | *(pré-git)* | 72.5 | 299.9 | 267.3 | 729.1 | 423.0 | 453.0 | 1700.4 | 1186.1 | **5131.3** | 1.926× | 24.5s | 8/8 |
 | V3 | `cb99e45` | 72.5 | 299.3 | 267.3 | 729.1 | 423.0 | 453.0 | 1688.4 | **1244.0** | **5176.7** | **1.943×** | 39.9s | 8/8 |
 | V4 | `5a7c489` | 72.5 | **299.9** | 267.3 | 729.1 | 423.0 | **455.8** | 1693.7 | 1217.1 | 5158.3 | 1.936× | 37.1s | 8/8 |
-| **V5** | *(courant)* | **72.5** | **299.9** | **267.3** | **729.1** | **423.0** | **455.8** | 1694.7 | 1223.9 | 5166.1 | 1.939× | **18.98s** | 8/8 |
+| V5 | `db81484` | **72.5** | **299.9** | **267.3** | **729.1** | **423.0** | **455.8** | 1694.7 | 1223.9 | 5166.1 | 1.939× | **18.98s** | 8/8 |
+| **V6** | *(courant)* | **72.5** | **299.9** | **267.3** | **729.1** | **423.0** | **455.8** | **1708.0** | 1239.5 | **5195.1** | **1.950×** | 30.37s | 8/8 |
 
 ---
 
@@ -166,3 +167,42 @@ Le profilage détaillé de V4 a révélé que **`eval_scout_tour` représentait 
   - `L4-401` : **1694.7** (`18.98 s` vs 37.08 s en V4 — **2.0× plus rapide**, +1.0 pt)
   - `L4-402` : **1223.9** (`15.97 s` vs 28.32 s en V4 — **1.8× plus rapide**, +6.8 pts)
 - **Temps max divisé par 2** : **18.98 s** (marge de **>41 s** sous la limite de 60 s !). Cela nous libère un énorme budget CPU pour pousser la qualité d'optimisation bien plus loin en V6+.
+
+---
+
+## Expérience V6 — Insertions Solo Débloquées par Hongrois + Déconfliction Zero-Slack & Rip-Up Inconditionnel
+
+### Diagnostics effectués sur V5 (Validation + 40 seeds inédits `L1–L4`)
+1. **Benchmark hors-distribution V5 (40 seeds `L1–L4, seeds 0–9`)** :
+   - **40/40 valides**, total **23 616.1** vs **11 847.8** baseline (**1.993×**), **L4 = 3.047× baseline** (`14 387.8` vs `4 722.0`).
+2. **Piège des scouts grande batterie déjà occupés** : sur `L4-401`, l'inconnu `C52` (`pts=29`, `soloScoutE=32.5 Wh`) restait non servi avec 7 scouts libres parce que les scouts grande batterie (`S06` 48.3 Wh, `S05` 43.7 Wh) volaient déjà des tournées courtes, et aucun des 7 scouts libres n'atteignait `C52` seul. Tester `_try_hungarian_scout_match(tours_actifs + [[C52]])` réaffecte automatiquement la tournée courte à un scout libre et débloque **`+8.60 pts` nets** !
+3. **Pertes massives de déconfliction scout (`+29.6 Wh` sur `L4-401 S09`, `+26.7 Wh` sur `L4-402 S11`)** :
+   - `S09` (5.5 Wh de marge) avait exactement `5.5 s` de marge d'atterrissage avant `t = 900 s`, mais la grille grossière `d_land = (2.5, 6.0, ...)` ratait `d_land = 4.5–5.0 s` (`+0.03 Wh`) et déclenchait un split à `+29.6 Wh` !
+   - `S11` (6.9 Wh de marge, seulement `4 s` de marge temporelle) heurtait `S04` (`0.15 Wh` de marge batterie mais des centaines de secondes de slack temporel `0 Wh`) ; la garde `scout_headroom[other] > my_hr + 1.0` bloquait à tort le Rip-Up de `S04`.
+   - Dans `_insert_local_dodge`, le clamping `f ∈ [0.05, 0.95]` et le double padding `+0.005 s` faisaient échouer les esquives verticales sur les jambes sans slack horizontal.
+
+### Modifications implémentées (V6)
+1. `deconflict.py` :
+   - Ajout de `_add_vertical_profile` (montée rapide `leg 0` / descente tardive `last leg` sur la même ligne horizontale : **0.00 s** de temps supplémentaire, **0.00 Wh** à `z = z_min`).
+   - Grilles monotones fines `launch_delays` (`1.0, 2.0, 3.0, 4.0, 5.0, 6.5, ...`) et `d_land` (`1.5, 3.0, 4.5, 6.0, 8.0, ...`) avec sortie anticipée (`break`) sur infaisabilité + combinaison profil vertical / dodge.
+   - Correction `_insert_local_dodge` (`f ∈ [0.015, 0.985]`, padding vertical `0.0005 s`).
+2. `solver.py` :
+   - **Insertions solo débloquées par `_try_hungarian_scout_match`** dans `_regret2_construct` (Phase 1 hostiles & Phase 2 unknowns), `_vnd_scout_routes` (Step 5 unknowns) et `_compute_true_marginals`.
+   - **Rip-Up & Re-Order inconditionnel** (jusqu'à 2 scouts conflictuels) en déconfliction scout (supprime la garde erronée sur `scout_headroom`).
+   - Stage 4 `deep_iters` augmenté à `55 / 45` grâce au gain de vitesse V5.
+3. `planner.py` : `time_budget_s` abaissé à **`45.0 s`** (marge stricte de 15 s sous la limite de 60 s).
+
+### Résultats V6
+- **Validation Set (8 scénarios)** : **5195.1 (+29.0 pts vs V5, 1.950× baseline)**, **8/8 valides**, max `30.37 s` :
+  - `L1–L3` : **tous au record historique** (`72.5 / 299.9 / 267.3 / 729.1 / 423.0 / 455.8`).
+  - **`L4-401` : 1708.0** *(nouveau record absolu, `+13.3 pts` vs V5, `30.37 s`)*.
+  - **`L4-402` : 1239.5** *(`+15.6 pts` vs V5, `24.46 s`)*.
+- **Benchmark Hors-Distribution (40 seeds inédits `L1–L4, seeds 0–9`)** :
+  | Niveau (10 seeds) | Baseline | V5 (`db81484`) | **V6** | Δ V6 vs V5 | Ratio Base | Valid | AvgT (6 cores) |
+  |---|---:|---:|---:|---:|---:|---:|---:|
+  | L1 | 1014.3 | 1138.3 | **1138.3** | +0.0 | 1.122× | 10/10 | 0.05s |
+  | L2 | 2318.1 | 2819.3 | **2819.5** | +0.2 | 1.216× | 10/10 | 0.30s |
+  | L3 | 3793.5 | 5270.7 | **5270.7** | +0.0 | 1.389× | 10/10 | 1.21s |
+  | L4 | 4722.0 | 14387.8 | **14406.4** | **+18.6** | **3.051×** | 10/10 | 35.32s |
+  | **TOTAL (40)** | **11847.8** | **23616.1** | **23635.0** | **+18.9** | **1.995×** | **40/40** | max 42.05s |
+- **Piste identifiée pour V7** : gros gains sur `L4-00 (+22.3)`, `L4-04 (+24.9)`, `L4-09 (+14.2)`, mais une chute isolée sur `L4-06 (1293.7 → 1255.5, -38.2 pts)` à diagnostiquer !

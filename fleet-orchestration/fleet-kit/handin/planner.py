@@ -17,7 +17,7 @@ from solver import solve_scenario
 
 def main() -> None:
     scenario = Scenario.from_dict(load_json(sys.argv[1]))
-    plan = solve_scenario(scenario, time_budget_s=48.0)
+    plan = solve_scenario(scenario, time_budget_s=45.0)
     save_json(plan, sys.argv[2])
 
 

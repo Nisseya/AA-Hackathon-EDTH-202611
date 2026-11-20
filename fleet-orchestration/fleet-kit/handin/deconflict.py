@@ -196,7 +196,7 @@ def _insert_local_dodge(
     if leg_dur < 1.5:
         return None
 
-    f = max(0.05, min(0.95, (t_conflict - a.depart) / leg_dur))
+    f = max(0.015, min(0.985, (t_conflict - a.depart) / leg_dur))
     mx = a.x + f * (b.x - a.x)
     my = a.y + f * (b.y - a.y)
     mz = a.z + f * (b.z - a.z)
@@ -225,14 +225,15 @@ def _insert_local_dodge(
     if not obs_map.segment_valid_3d(a.pos, dodge) or not obs_map.segment_valid_3d(dodge, b.pos):
         return None
 
+    pad_d = 0.0005 if vertical else 0.005
     dt1 = max(
         math.hypot(dodge[0] - a.x, dodge[1] - a.y) / ac.v_h_mps,
         (dodge[2] - a.z) / ac.v_up_mps if dodge[2] > a.z else (a.z - dodge[2]) / ac.v_down_mps,
-    ) + 0.005
+    ) + pad_d
     dt2 = max(
         math.hypot(b.x - dodge[0], b.y - dodge[1]) / ac.v_h_mps,
         (b.z - dodge[2]) / ac.v_up_mps if b.z > dodge[2] else (dodge[2] - b.z) / ac.v_down_mps,
-    ) + 0.005
+    ) + pad_d
 
     if dt1 + dt2 > leg_dur - 1e-4:
         return None
@@ -290,6 +291,51 @@ def _try_dodge_chain(
     return None
 
 
+def _add_vertical_profile(
+    wps_json: List[dict],
+    ac: Aircraft,
+    obs_map: ObstacleMap,
+    scenario: Scenario,
+    climb_z: Optional[float] = None,
+    descend_z: Optional[float] = None,
+) -> Optional[Tuple[List[dict], float]]:
+    """Adds early-climb (leg 0) and/or late-descent (last leg) waypoints along the exact horizontal path (0 extra time!)."""
+    r = scenario.rules
+    out = list(wps_json)
+    changed = False
+    if climb_z is not None and len(out) >= 2:
+        wps = _to_waypoints(out)
+        a, b = wps[0], wps[1]
+        leg_dt = b.t - a.depart
+        cz = max(r.z_min_m, min(r.z_max_m, climb_z))
+        tz = max(0.0, cz - a.z) / (ac.v_up_mps * 0.985)
+        if tz > 0.2 and leg_dt > tz + 0.4:
+            f = tz / leg_dt
+            p = (a.x + f * (b.x - a.x), a.y + f * (b.y - a.y), cz)
+            if obs_map.segment_valid_3d(a.pos, p) and obs_map.segment_valid_3d(p, b.pos):
+                out.insert(1, _wp_dict(a.depart + tz, p))
+                changed = True
+    if descend_z is not None and len(out) >= 2:
+        wps2 = _to_waypoints(out)
+        a, b = wps2[-2], wps2[-1]
+        leg_dt = b.t - a.depart
+        dz = max(r.z_min_m, min(r.z_max_m, descend_z))
+        tz = max(0.0, dz - b.z) / (ac.v_down_mps * 0.985)
+        if tz > 0.2 and leg_dt > tz + 0.4:
+            f = 1.0 - tz / leg_dt
+            p = (a.x + f * (b.x - a.x), a.y + f * (b.y - a.y), dz)
+            if obs_map.segment_valid_3d(a.pos, p) and obs_map.segment_valid_3d(p, b.pos):
+                out.insert(len(out) - 1, _wp_dict(b.t - tz, p))
+                changed = True
+    if not changed:
+        return None
+    parsed = _to_waypoints(out)
+    en = route_energy_wh(parsed, ac)
+    if en > ac.usable_wh - 1e-3 or not _check_r2_fast(parsed, ac, r.z_min_m, r.z_max_m, scenario.horizon_s):
+        return None
+    return out, en
+
+
 def place_scout_deconflicted(
     ac: Aircraft,
     contacts: Sequence[Contact],
@@ -339,6 +385,16 @@ def place_scout_deconflicted(
         t0_orig = base_wps[0]["t"]
         t_land_orig = base_wps[-1]["t"]
 
+        # 1b. Early-climb / late-descent vertical profile (0.00 s extra time, 0.00 Wh at z!)
+        for cz, dz in ((z, z), (z + 25.0, None), (None, z + 25.0), (z + 45.0, z + 45.0)):
+            vp = _add_vertical_profile(base_wps, ac, obs_map, scenario, climb_z=cz, descend_z=dz)
+            if vp is not None and (best_clean is None or vp[1] < best_clean[1] - 1e-4):
+                if sep_index.first_conflict(ac.id, vp[0]) is None:
+                    best_clean = (vp[0], vp[1], base_oends)
+                    if z_idx == 0 and vp[1] <= base_e + 0.05:
+                        return best_clean
+                    break
+
         # 2. Uniform time shifts (0 Wh!) — check early before paying any compression Wh!
         for dt in (1.5, -1.5, 3.5, -3.5, 7.0, -7.0, 12.0, -12.0, 20.0, -20.0, 32.0, -32.0, 50.0, -50.0):
             cand = build_scout_route(
@@ -356,8 +412,8 @@ def place_scout_deconflicted(
                     return best_clean
                 break
 
-        # 3. Targeted launch delay (min_t0) & landing advance (max_t_land) — handles pinned t0=0 or t_land=H
-        launch_delays = (1.5, 3.0, 5.5, 8.5, 13.0, 19.0, 28.0, 42.0, 62.0)
+        # 3. Targeted launch delay (min_t0) & landing advance (max_t_land) — fine monotone grid!
+        launch_delays = (1.0, 2.0, 3.0, 4.0, 5.0, 6.5, 8.5, 11.0, 15.0, 21.0, 30.0, 44.0, 62.0)
         for d_t0 in launch_delays:
             cand = build_scout_route(
                 ac, contacts, obs_pts, z, obs_map, scenario,
@@ -365,7 +421,7 @@ def place_scout_deconflicted(
                 min_t0=t0_orig + d_t0,
             )
             if cand is None:
-                continue
+                break  # Monotone in min_t0: larger delays are also infeasible
             wps, en, oends = cand
             if best_clean is not None and en >= best_clean[1] - 1e-4:
                 continue
@@ -375,15 +431,25 @@ def place_scout_deconflicted(
                 if z_idx == 0 and en <= base_e + 0.25:
                     return best_clean
                 break
+            # Try 0-Wh vertical profile on delayed launch
+            vp = _add_vertical_profile(wps, ac, obs_map, scenario, climb_z=z, descend_z=z)
+            if vp is not None and (best_clean is None or vp[1] < best_clean[1] - 1e-4):
+                if sep_index.first_conflict(ac.id, vp[0]) is None:
+                    best_clean = (vp[0], vp[1], oends)
+                    if z_idx == 0 and vp[1] <= base_e + 0.25:
+                        return best_clean
+                    break
             if c_hit[1] > wps[-1]["t"] - 45.0:
-                for d_land in (3.0, 7.0, 14.0, 25.0, 40.0):
+                for d_land in (1.5, 3.0, 4.5, 6.5, 10.0, 16.0, 25.0, 40.0):
                     cand2 = build_scout_route(
                         ac, contacts, obs_pts, z, obs_map, scenario,
                         max_obs_end_overrides=max_obs_end_overrides,
                         min_t0=t0_orig + d_t0,
                         max_t_land=wps[-1]["t"] - d_land,
                     )
-                    if cand2 is not None and sep_index.first_conflict(ac.id, cand2[0]) is None:
+                    if cand2 is None:
+                        break
+                    if sep_index.first_conflict(ac.id, cand2[0]) is None:
                         if best_clean is None or cand2[1] < best_clean[1]:
                             best_clean = cand2
                         break
@@ -393,19 +459,32 @@ def place_scout_deconflicted(
                     best_clean = (dodged[0], dodged[1], oends)
                     break
 
-        # 4. Landing-only advance (when conflict is near landing, not launch)
-        if conf0[1] > t_land_orig - 55.0:
-            for d_land in (2.5, 6.0, 12.0, 22.0, 38.0):
+        # 4. Landing-only advance (fine monotone grid — catches exact tight slack like d_land=4.5s!)
+        if conf0[1] > t_land_orig - 65.0:
+            for d_land in (1.5, 3.0, 4.5, 6.0, 8.0, 11.0, 16.0, 24.0, 38.0):
                 cand = build_scout_route(
                     ac, contacts, obs_pts, z, obs_map, scenario,
                     max_obs_end_overrides=max_obs_end_overrides,
                     max_t_land=t_land_orig - d_land,
                 )
                 if cand is None:
+                    break  # Monotone in max_t_land
+                if best_clean is not None and cand[1] >= best_clean[1] - 1e-4:
                     continue
-                if sep_index.first_conflict(ac.id, cand[0]) is None:
-                    if best_clean is None or cand[1] < best_clean[1]:
-                        best_clean = cand
+                c_hit = sep_index.first_conflict(ac.id, cand[0])
+                if c_hit is None:
+                    best_clean = cand
+                    if z_idx == 0 and cand[1] <= base_e + 0.25:
+                        return best_clean
+                    break
+                vp = _add_vertical_profile(cand[0], ac, obs_map, scenario, climb_z=z, descend_z=z)
+                if vp is not None and sep_index.first_conflict(ac.id, vp[0]) is None:
+                    if best_clean is None or vp[1] < best_clean[1]:
+                        best_clean = (vp[0], vp[1], cand[2])
+                    break
+                dodged = _try_dodge_chain(cand[0], ac, obs_map, scenario, sep_index, max_dodges=3)
+                if dodged is not None and (best_clean is None or dodged[1] < best_clean[1]):
+                    best_clean = (dodged[0], dodged[1], cand[2])
                     break
 
         # 5. Local 3D dodge chain on the nominal route
