@@ -1060,10 +1060,25 @@ class FleetSolver:
         placed_scout_tours: Dict[str, List[str]] = {}
         scout_headroom: Dict[str, float] = {}
 
-        # 1. Place scouts sorted by SMALLEST BATTERY HEADROOM first so tight scouts get 0-cost nominal routes!
+        # 1. Place scouts sorted by (launch_tier, battery_headroom, -len(cids))
+        # launch_tier captures exact joint time+battery takeoff flexibility (0=pinned at t0<2s, 1=tight<6s, 2=flexible).
         scout_entries = [(i, list(sol["tours"][i])) for i in range(len(self.scouts)) if sol["tours"][i]]
+        launch_tier: Dict[int, int] = {}
+        for s_idx, cids in scout_entries:
+            ac = self.scouts[s_idx]
+            contacts = [self.contact_map[cid] for cid in cids]
+            obs_pts = self.obs_map.optimize_disk_tour(ac.home[:2], contacts, self.r.z_min_m)
+            nom = build_scout_route(ac, contacts, obs_pts, self.r.z_min_m, self.obs_map, self.sc)
+            if nom is not None and nom[0] and nom[0][0]["t"] >= 3.0:
+                launch_tier[s_idx] = 2
+            elif build_scout_route(ac, contacts, obs_pts, self.r.z_min_m, self.obs_map, self.sc, min_t0=2.0) is None:
+                launch_tier[s_idx] = 0
+            elif build_scout_route(ac, contacts, obs_pts, self.r.z_min_m, self.obs_map, self.sc, min_t0=6.0) is None:
+                launch_tier[s_idx] = 1
+            else:
+                launch_tier[s_idx] = 2
         scout_entries.sort(
-            key=lambda pair: (self.scouts[pair[0]].usable_wh - sol["tour_e"][pair[0]], -len(pair[1]))
+            key=lambda pair: (launch_tier.get(pair[0], 2), self.scouts[pair[0]].usable_wh - sol["tour_e"][pair[0]], -len(pair[1]))
         )
 
         unplaced_scouts: List[Tuple[int, List[str]]] = []
@@ -1132,10 +1147,14 @@ class FleetSolver:
                     unplaced_scouts.append((s_idx, cids))
 
         # Rescue any remaining unplaced scout tour using idle scouts or smart splitting!
+        unplaced_ids = {self.scouts[si].id for si, _ in unplaced_scouts}
         for s_idx, cids in unplaced_scouts:
             ac = self.scouts[s_idx]
             contacts = [self.contact_map[cid] for cid in cids]
             idle_scouts = [a for a in self.scouts if a.id not in placed_scout_tours]
+            # Prefer truly idle scouts (not waiting in unplaced_scouts) first
+            idle_scouts.sort(key=lambda a: (1 if a.id in unplaced_ids else 0, a.id))
+            ac_is_free = ac.id not in placed_scout_tours
             placed_ok = False
 
             # Try putting the whole tour on the best feasible idle scout (sorted by energy!)
@@ -1157,64 +1176,84 @@ class FleetSolver:
             if placed_ok:
                 continue
 
-            # Blocker-Relocation Rescue: if `ac` is blocked by an already-placed scout `bid` (e.g., adjacent pad at t0=0),
-            # move the BLOCKING scout `bid`'s tour onto an idle scout on a distant pad so `ac` launches cleanly!
-            if not placed_ok and placed_scout_tours and idle_scouts and time.monotonic() < deadline:
+            # Multi-Blocker Relocation Rescue (1 or 2 blocking scouts on adjacent pads <50m):
+            # Remove up to 2 blocking scouts sequentially, place `ac`, and re-place each removed blocker
+            # either back on its own pad (if now feasible) or onto a distant idle scout (>=52m)!
+            if not placed_ok and ac_is_free and placed_scout_tours and time.monotonic() < deadline:
                 obs_pts_b = self.obs_map.optimize_disk_tour(ac.home[:2], contacts, self.r.z_min_m)
                 nom_b = build_scout_route(ac, contacts, obs_pts_b, self.r.z_min_m, self.obs_map, self.sc)
                 if nom_b is not None:
-                    # Collect up to 2 blocking scouts encountered at nominal launch/flight
-                    blockers: List[str] = []
-                    cf_b = sep.first_conflict(ac.id, nom_b[0])
-                    if cf_b is not None and cf_b[0] in placed_scout_tours:
-                        blockers.append(cf_b[0])
-                    for bid in blockers:
-                        bcids = placed_scout_tours[bid]
-                        bcontacts = [self.contact_map[x] for x in bcids]
-                        old_bwps = sep.routes_json[bid]
-                        # Candidate idle scouts for blocker `bid`, preferring pads far from `ac` and low energy
-                        b_idles = []
-                        for ia in idle_scouts:
-                            if ia.id == ac.id:
-                                continue
-                            eb = self.eval_scout_tour(ia, tuple(bcids))
-                            if eb is not None:
-                                b_idles.append((0 if hdist(ia.home, ac.home) >= 52.0 else 1, eb, ia))
-                        if not b_idles:
-                            continue
-                        b_idles.sort(key=lambda x: (x[0], x[1]))
+                    removed_bids: List[str] = []
+                    saved_bwps: Dict[str, List[dict]] = {}
+                    for _ in range(2):
+                        cf_b = sep.first_conflict(ac.id, nom_b[0])
+                        if cf_b is None or cf_b[0] not in placed_scout_tours or cf_b[0] in saved_bwps:
+                            break
+                        bid = cf_b[0]
+                        removed_bids.append(bid)
+                        saved_bwps[bid] = sep.routes_json[bid]
                         sep.remove(bid)
                         res_ac = place_scout_deconflicted(
                             ac, contacts, self.obs_map, self.sc, sep, preferred_z=self.r.z_min_m
                         )
-                        if res_ac is not None:
-                            sep.add(ac.id, res_ac[0])
-                            moved_b = None
-                            for _, _, ia in b_idles[:5]:
-                                r_ia = place_scout_deconflicted(
-                                    ia, bcontacts, self.obs_map, self.sc, sep, preferred_z=self.r.z_min_m
+                        if res_ac is None:
+                            continue
+                        sep.add(ac.id, res_ac[0])
+                        used_reloc_ids: Set[str] = {ac.id}
+                        relocated: List[Tuple[str, Aircraft, List[str], Tuple[List[dict], float, Dict[str, float]]]] = []
+                        all_reloc = True
+                        for rbid in removed_bids:
+                            bcids = placed_scout_tours[rbid]
+                            bcontacts = [self.contact_map[x] for x in bcids]
+                            orig_bac = self.aircraft_map[rbid]
+                            # Candidate hosts: original pad first (if not already taken), then distant feasible idle scouts
+                            b_cands: List[Tuple[int, float, Aircraft]] = []
+                            if rbid not in used_reloc_ids:
+                                eb0 = self.eval_scout_tour(orig_bac, tuple(bcids))
+                                if eb0 is not None:
+                                    b_cands.append((0, eb0, orig_bac))
+                            for ia in idle_scouts:
+                                if ia.id in used_reloc_ids or ia.id == ac.id:
+                                    continue
+                                eb = self.eval_scout_tour(ia, tuple(bcids))
+                                if eb is not None:
+                                    b_cands.append((1 if hdist(ia.home, ac.home) >= 52.0 else 2, eb, ia))
+                            b_cands.sort(key=lambda x: (x[0], x[1]))
+                            got = None
+                            for _, _, ha in b_cands[:6]:
+                                r_ha = place_scout_deconflicted(
+                                    ha, bcontacts, self.obs_map, self.sc, sep, preferred_z=self.r.z_min_m
                                 )
-                                if r_ia is not None:
-                                    moved_b = (ia, r_ia)
+                                if r_ha is not None:
+                                    got = (ha, r_ha)
                                     break
-                            if moved_b is not None:
-                                ia, r_ia = moved_b
-                                sep.add(ia.id, r_ia[0])
-                                obs_end_by_cid.update(res_ac[2])
-                                obs_end_by_cid.update(r_ia[2])
-                                placed_scout_tours.pop(bid, None)
-                                scout_headroom.pop(bid, None)
-                                placed_scout_tours[ac.id] = cids
-                                placed_scout_tours[ia.id] = bcids
-                                scout_headroom[ac.id] = ac.usable_wh - res_ac[1]
-                                scout_headroom[ia.id] = ia.usable_wh - r_ia[1]
-                                placed_ok = True
+                            if got is None:
+                                all_reloc = False
                                 break
-                            else:
-                                sep.remove(ac.id)
-                                sep.add(bid, old_bwps)
+                            ha, r_ha = got
+                            sep.add(ha.id, r_ha[0])
+                            used_reloc_ids.add(ha.id)
+                            relocated.append((rbid, ha, bcids, r_ha))
+                        if all_reloc:
+                            for rbid in removed_bids:
+                                placed_scout_tours.pop(rbid, None)
+                                scout_headroom.pop(rbid, None)
+                            obs_end_by_cid.update(res_ac[2])
+                            placed_scout_tours[ac.id] = cids
+                            scout_headroom[ac.id] = ac.usable_wh - res_ac[1]
+                            for _, ha, bcids, r_ha in relocated:
+                                obs_end_by_cid.update(r_ha[2])
+                                placed_scout_tours[ha.id] = bcids
+                                scout_headroom[ha.id] = ha.usable_wh - r_ha[1]
+                            placed_ok = True
+                            break
                         else:
-                            sep.add(bid, old_bwps)
+                            sep.remove(ac.id)
+                            for _, ha, _, _ in relocated:
+                                sep.remove(ha.id)
+                    if not placed_ok:
+                        for rbid, owps in saved_bwps.items():
+                            sep.add(rbid, owps)
             if placed_ok:
                 continue
 
@@ -1240,7 +1279,8 @@ class FleetSolver:
                     old_owps = sep.routes_json[oid]
                     # Candidate hosts for `ocids`: original `ac` plus feasible idle scouts
                     alt_hosts = []
-                    for ha in [ac] + [ia for ia in idle_scouts if ia.id != ac.id]:
+                    cand_ha = ([ac] if ac_is_free else []) + [ia for ia in idle_scouts if ia.id != ac.id]
+                    for ha in cand_ha:
                         eh = self.eval_scout_tour(ha, tuple(ocids))
                         if eh is not None:
                             alt_hosts.append((eh, ha))
@@ -1295,9 +1335,10 @@ class FleetSolver:
                         if cand_i not in pick_idles:
                             pick_idles.append(cand_i)
                 scout_pairs: List[Tuple[Aircraft, Aircraft]] = []
-                for oi in pick_idles[:4]:
-                    scout_pairs.append((ac, oi))
-                    scout_pairs.append((oi, ac))
+                if ac_is_free:
+                    for oi in pick_idles[:4]:
+                        scout_pairs.append((ac, oi))
+                        scout_pairs.append((oi, ac))
                 if len(pick_idles) >= 2:
                     scout_pairs.append((pick_idles[0], pick_idles[1]))
                     scout_pairs.append((pick_idles[1], pick_idles[0]))
@@ -1336,16 +1377,17 @@ class FleetSolver:
 
             if not placed_ok:
                 # Last resort: smart surgical trimming — try removing EACH single contact first so 1 pinned stop doesn't destroy the whole tour!
+                trim_ac = ac if ac_is_free else (max(idle_scouts, key=lambda a: a.usable_wh) if idle_scouts else None)
                 cur_cids = list(cids)
                 dropped_from_tour: List[str] = []
-                while len(cur_cids) >= 1:
+                while trim_ac is not None and len(cur_cids) >= 1:
                     res = place_scout_deconflicted(
-                        ac, [self.contact_map[x] for x in cur_cids], self.obs_map, self.sc, sep, preferred_z=self.r.z_min_m
+                        trim_ac, [self.contact_map[x] for x in cur_cids], self.obs_map, self.sc, sep, preferred_z=self.r.z_min_m
                     )
                     if res is not None:
-                        sep.add(ac.id, res[0])
+                        sep.add(trim_ac.id, res[0])
                         obs_end_by_cid.update(res[2])
-                        placed_scout_tours[ac.id] = cur_cids
+                        placed_scout_tours[trim_ac.id] = cur_cids
                         break
                     if len(cur_cids) >= 2:
                         best_sub = None
@@ -1353,7 +1395,7 @@ class FleetSolver:
                             sub_cids = cur_cids[:drop_idx] + cur_cids[drop_idx + 1 :]
                             sub_contacts = [self.contact_map[x] for x in sub_cids]
                             r_sub = place_scout_deconflicted(
-                                ac, sub_contacts, self.obs_map, self.sc, sep, preferred_z=self.r.z_min_m
+                                trim_ac, sub_contacts, self.obs_map, self.sc, sep, preferred_z=self.r.z_min_m
                             )
                             if r_sub is not None:
                                 kept_val = sum(self.contact_map[x].points for x in sub_cids) - self.r.lambda_e * r_sub[1]
@@ -1361,9 +1403,9 @@ class FleetSolver:
                                     best_sub = (kept_val, sub_cids, r_sub, drop_cand)
                         if best_sub is not None:
                             _, sub_cids, r_sub, drop_cand = best_sub
-                            sep.add(ac.id, r_sub[0])
+                            sep.add(trim_ac.id, r_sub[0])
                             obs_end_by_cid.update(r_sub[2])
-                            placed_scout_tours[ac.id] = sub_cids
+                            placed_scout_tours[trim_ac.id] = sub_cids
                             dropped_from_tour.append(drop_cand)
                             break
                     drop_c = min(
@@ -1891,6 +1933,131 @@ class FleetSolver:
 
         return best
 
+    def _pad_spread_scout_sol(self, sol: dict, min_pad_dist: float = 51.0) -> Optional[dict]:
+        """Re-assigns active scout tours via branch-and-bound + Hungarian so all t0-pinned tours sit >= min_pad_dist apart."""
+        active_tours: List[Tuple[int, List[str]]] = [
+            (i, list(sol["tours"][i])) for i in range(len(self.scouts)) if sol["tours"][i]
+        ]
+        k = len(active_tours)
+        n_s = len(self.scouts)
+        if k < 2 or k > n_s:
+            return None
+
+        # Classify launch tightness of each active tour on its current scout
+        pinned_indices: List[int] = []
+        tight_indices: List[int] = []
+        for t_idx, (s_idx, cids) in enumerate(active_tours):
+            ac = self.scouts[s_idx]
+            contacts = [self.contact_map[cid] for cid in cids]
+            obs_pts = self.obs_map.optimize_disk_tour(ac.home[:2], contacts, self.r.z_min_m)
+            nom = build_scout_route(ac, contacts, obs_pts, self.r.z_min_m, self.obs_map, self.sc)
+            if nom is not None and nom[0] and nom[0][0]["t"] >= 3.0:
+                continue
+            if build_scout_route(ac, contacts, obs_pts, self.r.z_min_m, self.obs_map, self.sc, min_t0=2.0) is None:
+                pinned_indices.append(t_idx)
+            elif build_scout_route(ac, contacts, obs_pts, self.r.z_min_m, self.obs_map, self.sc, min_t0=6.0) is None:
+                tight_indices.append(t_idx)
+
+        target_group = pinned_indices if len(pinned_indices) >= 2 else (pinned_indices + tight_indices)
+        if len(target_group) < 2:
+            return None
+
+        # Check if any pair in target_group currently violates pad separation
+        has_close = False
+        for i in range(len(target_group)):
+            s1 = self.scouts[active_tours[target_group[i]][0]]
+            for j in range(i + 1, len(target_group)):
+                s2 = self.scouts[active_tours[target_group[j]][0]]
+                if hdist(s1.home, s2.home) < min_pad_dist:
+                    has_close = True
+                    break
+            if has_close:
+                break
+        if not has_close:
+            return None
+
+        # Precompute exact tour-to-scout energy matrix
+        cost_mat: List[List[Optional[float]]] = []
+        for _, cids in active_tours:
+            tc = tuple(cids)
+            cost_mat.append([self.eval_scout_tour(self.scouts[s], tc) for s in range(n_s)])
+
+        # Cap group size to 4 tightest (fewest feasible scouts first) for instant branch-and-bound
+        target_group.sort(key=lambda ti: sum(1 for e in cost_mat[ti] if e is not None))
+        target_group = target_group[:4]
+        group_set = set(target_group)
+        rest_indices = [ti for ti in range(k) if ti not in group_set]
+
+        best_total = float("inf")
+        best_assign: Optional[Dict[int, int]] = None
+        hung_calls = [0]
+
+        def dfs(pos: int, chosen: Dict[int, int], chosen_scouts: List[int], cur_e: float) -> None:
+            nonlocal best_total, best_assign
+            if hung_calls[0] >= 36 or cur_e >= best_total:
+                return
+            if pos == len(target_group):
+                rem_scouts = [s for s in range(n_s) if s not in chosen_scouts]
+                if not rest_indices:
+                    if cur_e < best_total:
+                        best_total = cur_e
+                        best_assign = dict(chosen)
+                    return
+                if len(rem_scouts) < len(rest_indices):
+                    return
+                hung_calls[0] += 1
+                sub_mat = [
+                    [cost_mat[ti][s] if cost_mat[ti][s] is not None else INF for s in rem_scouts]
+                    for ti in rest_indices
+                ]
+                sub_tot, c_for_r = hungarian_min_cost(sub_mat)
+                if sub_tot >= INF * 0.25:
+                    return
+                tot = cur_e + sub_tot
+                if tot < best_total:
+                    best_total = tot
+                    full = dict(chosen)
+                    for r_i, ti in enumerate(rest_indices):
+                        full[ti] = rem_scouts[c_for_r[r_i]]
+                    best_assign = full
+                return
+
+            ti = target_group[pos]
+            cands = []
+            for s in range(n_s):
+                e = cost_mat[ti][s]
+                if e is None or s in chosen_scouts:
+                    continue
+                if all(hdist(self.scouts[s].home, self.scouts[ps].home) >= min_pad_dist for ps in chosen_scouts):
+                    cands.append((e, s))
+            cands.sort()
+            for e, s in cands[:6]:
+                chosen[ti] = s
+                chosen_scouts.append(s)
+                dfs(pos + 1, chosen, chosen_scouts, cur_e + e)
+                chosen_scouts.pop()
+                del chosen[ti]
+
+        dfs(0, {}, [], 0.0)
+        if best_assign is None:
+            return None
+
+        # Verify assignment actually changed
+        if all(best_assign[ti] == active_tours[ti][0] for ti in range(k)):
+            return None
+
+        new_tours: List[List[str]] = [[] for _ in range(n_s)]
+        new_tour_e: List[float] = [0.0] * n_s
+        for ti, (_, cids) in enumerate(active_tours):
+            ns = best_assign[ti]
+            new_tours[ns] = list(cids)
+            new_tour_e[ns] = cost_mat[ti][ns]  # type: ignore[assignment]
+        new_sol = dict(sol)
+        new_sol["tours"] = new_tours
+        new_sol["tour_e"] = new_tour_e
+        new_sol["scout_e"] = sum(new_tour_e)
+        return new_sol
+
     def solve(self, time_budget_s: float = 45.0) -> dict:
         """Main anytime solver entry point, strictly respecting time_budget_s."""
         t_start = time.monotonic()
@@ -1912,6 +2079,13 @@ class FleetSolver:
         def record_sol(sol: Optional[dict]) -> None:
             if sol is None:
                 return
+            k_new = (frozenset(sol["hostiles"]), round(sol["scout_e"], 1))
+            for i, ex in enumerate(top_sols):
+                if (frozenset(ex["hostiles"]), round(ex["scout_e"], 1)) == k_new:
+                    if sol["score"] > ex["score"]:
+                        top_sols[i] = sol
+                        top_sols.sort(key=lambda s: -s["score"])
+                    return
             top_sols.append(sol)
             top_sols.sort(key=lambda s: -s["score"])
             if len(top_sols) > 8:
@@ -2014,11 +2188,39 @@ class FleetSolver:
             if score > best_valid_score:
                 best_valid_score = score
                 best_plan = plan
+            # Pad-Spread Hungarian fallback whenever deconfliction lost >3.5 pts (e.g., t0-pinned scouts on <50m pads)
+            if score < sol["score"] - 3.5 and time.monotonic() < hard_deadline - 2.0:
+                spread_sol = self._pad_spread_scout_sol(sol)
+                if spread_sol is not None:
+                    sp_plan, sp_score = self.deconflict_and_build_plan(spread_sol, hard_deadline)
+                    if sp_score > best_valid_score:
+                        best_valid_score = sp_score
+                        best_plan = sp_plan
 
-        # Stage 6: Anytime extra perturbed restarts if time remains on larger scenarios
+        # Stage 6: Anytime extra restarts if time remains on larger scenarios
         if n_h > 8 and time.monotonic() < t_start + time_budget_s * 0.78 and top_sols:
             extra_deadline = t_start + time_budget_s * 0.88
             cur_best = top_sols[0]
+            # 6a. Fresh VRPTW topology restarts on the winning hostile subset if deconfliction still has gap > 3.5 pts
+            if best_valid_score < cur_best["score"] - 3.5:
+                for _ in range(2):
+                    if time.monotonic() > extra_deadline:
+                        break
+                    r_sol = self.evaluate_subset(
+                        cur_best["hostiles"], extra_deadline, alns_iters=14, rng=rng, seed_tours=None, deep_vnd=True
+                    )
+                    if r_sol is not None and r_sol["score"] > best_valid_score + 0.5:
+                        r_plan, r_score = self.deconflict_and_build_plan(r_sol, hard_deadline)
+                        if r_score > best_valid_score:
+                            best_valid_score = r_score
+                            best_plan = r_plan
+                        if r_score < r_sol["score"] - 3.5 and time.monotonic() < hard_deadline - 2.0:
+                            sp_sol = self._pad_spread_scout_sol(r_sol)
+                            if sp_sol is not None:
+                                sp_plan, sp_score = self.deconflict_and_build_plan(sp_sol, hard_deadline)
+                                if sp_score > best_valid_score:
+                                    best_valid_score = sp_score
+                                    best_plan = sp_plan
             m_scout, m_eff = self._compute_true_marginals(cur_best)
             for p_it in range(12):
                 if time.monotonic() > extra_deadline:
