@@ -120,3 +120,76 @@ Nous introduisons donc une architecture en deux étages ([`c2_companion/packages
 *(Bug détecté et corrigé durant l'expérimentation : la première passe incluait les contacts `unknown` dans le calcul de `min_collateral_m` d'un paquet mixte, affichant `125 m` alors que R7 ne s'applique qu'aux frappes létales `hostile`. Le filtrage strict sur `HOSTILE` dans [`packages.py`](c2_companion/packages.py) a corrigé la métrique à `255 m` et `218 m`, strictement $\ge 200\text{ m}$.)*
 
 ---
+
+## 3. Expérience 3 — Couche D (Partie I) : Étude de Passage à l'Échelle de V10 (5 → 400 Drones) & Point de Rupture
+
+### 3.1 Question de Recherche & Protocole
+La fiche track demande explicitement : *« Scaling study: how far can your planner go before it breaks (30 to 100+ aircraft)? »*  
+Notre planner certifié **V10** est validé sur **1 000 scénarios officiels L1–L4** (RunPod, seeds `1000..1249`, budget `45 s`) avec les percentiles de latence suivants :
+
+| Niveau ($N$ drones) | $n$ | Score V10 | Baseline | Ratio | $t_{\text{moy}}$ | $p_{50}$ | $p_{90}$ | $p_{99}$ | $t_{\max}$ | Valides |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **L1** (`5`) | 250 | 101.5 | 91.7 | `1.106×` | 0.04 s | 0.04 s | 0.05 s | 0.06 s | 0.06 s | 250/250 |
+| **L2** (`12`) | 250 | 259.9 | 227.9 | `1.141×` | 0.15 s | 0.14 s | 0.23 s | 0.30 s | 0.39 s | 250/250 |
+| **L3** (`30`) | 250 | 540.9 | 391.7 | `1.381×` | 0.74 s | 0.66 s | 1.17 s | 2.04 s | 2.44 s | 250/250 |
+| **L4** (`100`) | 250 | 1 519.0 | 531.8 | **`2.856×`** | 18.93 s | 17.18 s | 31.65 s | 42.98 s | 44.44 s | 250/250 |
+
+Pour identifier **où et pourquoi** V10 casse au-delà de L4, nous avons construit [`c2_companion/scaling_bench.py`](c2_companion/scaling_bench.py) :
+- **Générateur étendu physiquement cohérent** (`N ∈ {5, 12, 30, 60, 100, 150, 200, 225, 250, 300, 400}`, proportions exactes de L4 : `15%` scouts, `50%` light, `35%` heavy, `0.90 N` contacts) sous **deux régimes** :
+  1. *Régime A (`fixed_theater`)* : théâtre fixe `7 000 m`, `8` zones — teste la densification pure (congestion pad R8, collatéraux R7, combinatoire).
+  2. *Régime B (`scaled_area`)* : aire $\propto N^{0.25}$ (capée à `9 000 m` pour rester sous l'horizon batterie) et zones $\propto N^{0.5}$.
+- **Instrumentation non invasive** via la sous-classe [`InstrumentedFleetSolver`](c2_companion/scaling_bench.py#L90) mesurant `t_init`, `t_knapsack`, `t_eval_subset`, `t_deconflict` et `t_validate` (sans modifier `handin/`).
+
+### 3.2 Résultats — Courbe de Passage à l'Échelle (Régime A : `fixed_theater`)
+
+| $N$ drones | Contacts | Valides | $\le 60\text{ s}$ | $t_{\text{tot}}$ | `t_init` | `knap/c` | `eval/c` (×appels) | `deconf/c` (×appels) | `validate` | Score V10 | vs Base | Cibles servies |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **5** (L1) | 5 | 3/3 | 3/3 | 0.01 s | 0.00 s | 0.000 s | 0.000 s (×4.0) | 0.00 s (×1.0) | 0.0002 s | 66.3 | `1.14×` | 2.0 |
+| **12** (L2) | 11 | 3/3 | 3/3 | 0.25 s | 0.01 s | 0.000 s | 0.017 s (×13.3) | 0.01 s (×1.0) | 0.0009 s | 254.6 | `1.23×` | 7.0 |
+| **30** (L3) | 25 | 3/3 | 3/3 | 2.20 s | 0.03 s | 0.0003 s | 0.561 s (×4.7) | 0.03 s (×1.0) | 0.0029 s | 632.9 | `1.42×` | 16.7 |
+| **60** | 54 | 3/3 | 3/3 | 6.24 s | 0.27 s | 0.0017 s | 0.585 s (×11.7) | 0.17 s (×2.7) | 0.0183 s | 971.6 | `2.71×` | 29.3 |
+| **100** (L4) | 90 | 3/3 | 3/3 | 25.88 s | 1.28 s | 0.0063 s | 1.974 s (×17.0) | 0.51 s (×3.0) | 0.0388 s | 1 414.4 | `3.37×` | 44.7 |
+| **150** | 135 | 3/3 | 3/3 | 43.59 s | 3.23 s | 0.0214 s | 11.446 s (×3.3) | 1.77 s (×3.3) | 0.1040 s | 2 232.0 | `3.37×` | 68.7 |
+| **200** | 180 | 3/3 | 3/3 | 52.76 s | 7.04 s | 0.0567 s | 27.063 s (×1.3) | 5.46 s (×2.7) | 0.2488 s | 3 009.7 | **`4.38×`** | 94.7 |
+| **225** | 202 | 2/2 | 2/2 | 53.40 s | 9.06 s | 0.0549 s | 32.611 s (×1.0) | 4.55 s (×2.5) | 0.1784 s | 3 308.9 | — | 110.5 |
+| **250** | 225 | 2/2 | **2/2** *(max 59.2 s)* | 54.00 s | 7.24 s | 0.0706 s | 32.602 s (×1.0) | 10.06 s (×2.0) | 0.1620 s | 3 598.7 | — | 114.0 |
+| **300** | 270 | 3/3 | **0/3** | **74.47 s** | **26.70 s** | 0.1545 s | 32.894 s (×1.0) | **13.96 s** (×1.0) | 0.2491 s | **4 017.5** | — | **134.0** |
+| **400** | 360 | 2/2 | **0/2** | **102.07 s** | **49.60 s** | 0.2399 s | 34.499 s (×1.0) | **15.23 s** (×1.0) | 0.2974 s | **3 372.9** *(chute!)* | — | **94.0** |
+
+*Régime B (`scaled_area`)* : résultats concordants — `N=100` : `40.46 s` (`2.59×` base) ; `N=200` : `49.97 s` (`3.29×` base, `2/2 <= 60 s`) ; `N=300` : `83.07 s` (`0/2 <= 60 s`, `t_init = 23.93 s`, `deconf = 25.88 s`).
+
+### 3.3 Lois de Puissance Empiriques & Diagnostic des Deux Points de Rupture
+La régression log-log sur $N \in [30, 300]$ (Régime A) révèle avec $R^2 > 0.994$ la structure asymptotique exacte de chaque sous-système :
+
+| Sous-système | Loi de puissance empirique | $R^2$ | Complexité théorique & cause racine |
+| :--- | :--- | :---: | :--- |
+| **`t_init` (`FleetSolver.__init__`)** | $T(N) pprox 1.29 	imes 10^{-6} \cdot N^{2.95}$ | **0.9960** | **$O(N^3)$** : boucle `(N_hostile × N_effector)` appelant [`effector_min_cost()`](fleet-kit/handin/timing.py#L629) → `best_path_3d()` contre `O(N)` cylindres protégés (`0.20 N` amis/civils). À $N=400$, `__init__` brûle seul **`49.60 s`** (et n'était pas décompté de `time_budget_s` !). |
+| **`t_deconf_per_call`** | $T(N) pprox 2.05 	imes 10^{-6} \cdot N^{2.75}$ | **0.9948** | **$O(N^{2.75})$** : [`SeparationIndex.first_conflict()`](fleet-kit/handin/deconflict.py#L130) scanne linéairement toutes les routes déjà placées sans indexation spatio-temporelle, multiplié par l'augmentation du nombre d'essais R8 sur un pad congestionné. |
+| **`t_knap_per_call`** | $T(N) pprox 2.34 	imes 10^{-8} \cdot N^{2.75}$ | **0.9977** | **$O(N_h \cdot N_L \cdot N_H) = O(N^3)$** : DP exacte 2D, mais constante très faible (`0.24 s` même à `N=400`). |
+| **`fleetkit.validate()`** | $T(N) pprox 3.72 	imes 10^{-6} \cdot N^{2.02}$ | 0.9699 | **$O(N^2)$** : boucle double `_r8` du validateur officiel (`0.30 s` à `N=400`, non limitant). |
+
+**Deux points de rupture distincts identifiés** :
+1. **Point de rupture temps réel ($60\text{ s}$) : $N^*_{60\text{s}} \approx 250\text{ drones}$ (`2.5×` L4)** — V10 reste **100% valide** (`36/36` runs jusqu'à `N=400`) et atteint **`4.38×` baseline à `N=200`**, mais dépasse `60 s` dès `N > 250` car `t_init` ($O(N^{2.95})$, hors budget) + `search_deadline` fixe (`32.4 s`) + `deconflict` ($O(N^{2.75})$) dépassent mécaniquement `60 s`.
+2. **Point de rupture qualité / physique : $N \approx 350\text{–}400\text{ drones}$** — Le score passe de `4 018` (`N=300`) à `3 373` (`N=400`) : d'une part, la 1re passe `evaluate_subset` n'arrive plus à converger en `32 s` ; d'autre part, dans un théâtre fixe `7×7 km` à pad unique `100×100 m`, l'espacement entre pads tombe à `5.2 m` (`< d_sep_m = 40 m`) et 80 contacts amis/civils couvrent >20% de la carte en rayons collatéraux R7.
+
+---
+
+## 5. Annexe E — Audit Exécutable des Règles R1–R10 (*« What breaks the rules? »* & *Loopholes*)
+
+La fiche track pose explicitement la question *« What breaks the rules? »* et le [`README.md`](README.md#L47) invite les équipes à signaler les *loopholes* : *« A plan the rules accept can still be silly; tell us if you find a loophole. »*  
+Nous avons audité [`fleetkit/validator.py`](fleet-kit/fleetkit/validator.py) et construit **5 preuves de concept exécutables** ([`c2_companion/rule_audit.py`](c2_companion/rule_audit.py)), toutes vérifiées directement contre le validateur officiel (`5/5` acceptées avec **0 violation**) :
+
+| ID | Règle | Sévérité | Accepté par `validate()` | Constat technique & impact |
+| :--- | :---: | :---: | :---: | :--- |
+| `LOOPHOLE-R2-GROUND-CRAWL` | **R2** | **Haute** | **Oui (0 viol.)** | Un effecteur à 2 waypoints `[home(z=0) → target(z=0)]` vole à **`z = 0.0 m`** sur la **totalité** de son vol (`1 988 m`), n'entre jamais dans `[30 m, 150 m]`, paie `0 Wh` d'énergie de montée (`-0.72 Wh`, `+0.36 pts`/effecteur) et passe `_r2` car le dernier waypoint autorise `low = 0.0` et l'altitude des *segments* n'est jamais vérifiée. |
+| `LOOPHOLE-R2-SUB-ZMIN-SKIM` | **R2** | Moyenne | **Oui (0 viol.)** | Un scout à 3 waypoints `(home, 0) → (target, 30 m) → (home, 0)` passe 100% de ses deux trajets de croisière (`1 932 m` chacun) strictement sous `z_min = 30 m` (altitude moyenne `15 m`), accepté car `_r2` ne teste que les waypoints intermédiaires. |
+| `LOOPHOLE-R8-MIDAIR-COLLISION` | **R8** | Moyenne | **Oui (0 viol.)** | Deux effecteurs visant le même hostile peuvent **entrer en collision exacte (`0.0 m` en 3D à `z = 35 m`, à `61 m` de la cible)** `8 à 22 s` *avant* l'impact (avec `14 s` d'écart entre frappes), et `_r8` l'accepte car les deux sont dans la sphère `exempt_radius_m = 100 m`. |
+| `SPEC-R10-AIRBURST-25M` | **R10** | Basse *(physique)* | **Oui (0 viol.)** | L'engagement vérifie `dist3 <= R_eng_m = 25 m` : un effecteur peut engager en *airburst* à `z = 24.9 m` directement au-dessus de la cible sans piquer jusqu'au sol, économisant du temps de descente. |
+| `SPEC-R8-GROUND-CLOAK` | **R8 + Gen.** | Moyenne *(réalisme)* | **Oui (0 viol.)** | En L4 (100 drones), les pads du générateur sont espacés de **`11.1 m`** (`< d_sep_m = 40 m`). Comme `route_pieces()` ignore les appareils avant `w[0].depart`, un drone qui décolle survole ses voisins garés à `11.1 m` sans violation (« cape au sol »), mais deux décollages simultanés à `< 40 m` violent immédiatement R8 — créant un goulot physique de débit de décollage à très grande échelle ($N \ge 200$). |
+
+**Recommandations simples de durcissement pour les organisateurs** :
+1. Dans `_r2`, exiger qu'une route d'effecteur atteigne `z >= z_min_m` sur au moins un waypoint de croisière (ou vérifier la pente minimale de montée/descente près de `home`/`target`).
+2. Dans `_r8`, restreindre l'exemption `exempt_radius_m` aux `Δt <= 5 s` précédant l'engagement ou à un rayon terminal plus serré (`30–50 m`).
+3. Dans le générateur au-delà de L4, étendre l'empreinte de base proportionnellement à $\sqrt{N}$ (ou ajouter plusieurs bases déportées) pour éviter la congestion artificielle d'un pad unique de `100 × 100 m`.
+
+---
