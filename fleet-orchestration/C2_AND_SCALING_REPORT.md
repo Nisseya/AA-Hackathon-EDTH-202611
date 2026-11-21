@@ -72,3 +72,51 @@ Dans un système C2 militaire (*Command & Control*), un opérateur humain ne peu
 2. **Profil de criticité ROE** : Sur les 532 contacts servis, `37.6%` sont de l'ISR non létal (`LOW_RECON`), **`9.2%` (49 contacts)** sont des frappes proches de civils/amis (`HIGH_SCRUTINY_COLLATERAL`, `200–400 m`) qui méritent une revue humaine isolée, et `50.4%` sont en `TIGHT_MARGIN_STRIKE` principalement car V10 serre délibérément la marge R4 à `+0.05 s` pour compacter les tournées scouts. Ce constat motive directement la **stratification ROE** de l'Expérience 2.
 
 ---
+
+## 2. Expérience 2 — Couche C : Réduction d'Approbations (*Fewer Approvals*) & Couches Viewer C2
+
+### 2.1 Intuition, Théorème de Veto Sûr & Stratification ROE
+Sur un théâtre L4, le planner V10 active en moyenne **69.9 drones** servant **48.0 contacts**. Demander à un commandant C2 d'approuver chaque drone ou chaque cible individuellement crée une surcharge cognitive critique (*approval fatigue*).  
+En revanche, un regroupement géométrique naïf **casse la validité R1–R10 en cas de veto** : si deux cibles partagent le même scout confirmateur et que l'opérateur rejette l'une des deux, la suppression naïve du scout invalide l'engagement de l'autre (violation **R4**).
+
+Nous introduisons donc une architecture en deux étages ([`c2_companion/packages.py`](c2_companion/packages.py)) :
+1. **Décomposition en Composantes Connexes Atomiques (`ATOMIC_CC`)** : construction du graphe biparti de dépendances entre appareils actifs et contacts servis (arêtes `(scout, contact)` et `(effecteur, contact)`). Chaque composante connexe est une unité indivisible.
+2. **Regroupement Spatio-Temporel Stratifié par Risque ROE (`ROE_WAVE_K`)** : fusion agglomérative des composantes atomiques *strictement à l'intérieur de 3 strates ROE hermétiques* (on ne mélange jamais ISR non létal et frappe proche de civils) :
+   - `RECON_ONLY` : ISR pur (`unknown`, 0 effecteur) → 1 approbation groupée ;
+   - `STANDARD_STRIKE` : frappes `hostile` avec marge collatérale R7 $\ge 400\text{ m}$ → fusionnées par proximité espace-temps avec régularisation *Value-at-Risk* (évitant qu'un seul paquet n'absorbe trop de valeur) ;
+   - `HIGH_SCRUTINY_STRIKE` : frappes `hostile` à marge R7 dans $[200\text{ m}, 400\text{ m})$ → isolées dans des paquets dédiés à haute vigilance.
+
+> **Théorème (Veto Sûr Sans Cascade sous R1–R10)** : Si un plan est valide et que chaque *Strike Package* $P_k$ est une union disjointe de composantes connexes de dépendances, alors **rejeter n'importe quel sous-ensemble arbitraire $\mathcal{R} \subseteq \{P_1, \dots, P_K\}$** en supprimant simplement les routes des appareils de $\mathcal{R}$ produit **nécessairement un plan 100% valide sous R1–R10** (aucune nouvelle violation R4, R10 ou R8 possible : retirer des drones ne peut qu'enlever des paires de séparation R8).
+
+### 2.2 Protocole Expérimental
+- **Script reproductible** : [`c2_companion/exp2_packages.py`](c2_companion/exp2_packages.py).
+- **Jeu de test** : les mêmes **28 scénarios** (8 validation + 20 `check_handin`), en comparant 4 politiques : `ATOMIC_CC`, `ROE_WAVE_K` avec $K_{\max} \in \{8, 6, 4\}$.
+- **Certification empirique du Veto Sûr** : exécution réelle du validateur officiel [`fleetkit.scorer.evaluate`](fleet-kit/fleetkit/scorer.py) après suppression de **chaque paquet individuellement** (*Single-Veto*) ET de **8 sous-ensembles aléatoires multi-paquets** (*Multi-Veto*) par scénario et par politique — soit **910 tests de veto complets**.
+- **Intégration Viewer C2** : génération de pages HTML autonomes offline via [`c2_companion/demo_viewer.py`](c2_companion/demo_viewer.py) pour `L3-301` et `L4-401` avec enveloppes convexes des paquets, liens *kill-chain* R4 temporisés, marqueurs de contacts rejetés (audit contrefactuel) et point de séparation R8 minimal.
+
+### 2.3 Résultats Quantitatifs
+
+| Politique | Niveau | Routes actives | Cibles servies | CCs atomiques | **Paquets ($K$)** | **Réduction vs Routes** | **Réduction vs Cibles** | Max VaR / paquet | **Certification Veto Sûr** |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| `ATOMIC_CC` | L1 | 3.2 | 2.5 | 1.0 | **1.0** | -65.3% | -58.4% | 100.0% | 6/6 (100%) |
+| `ATOMIC_CC` | L2 | 8.7 | 7.4 | 1.4 | **1.4** | -83.7% | -81.1% | 87.7% | 7/7 (100%) |
+| `ATOMIC_CC` | L3 | 22.1 | 16.1 | 2.5 | **2.5** | -88.7% | -84.4% | 58.2% | 8/8 (100%) |
+| `ATOMIC_CC` | **L4** | 69.9 | 48.0 | 9.3 | **9.3** | **-86.7%** | **-80.6%** | **22.3%** | **7/7 (100%)** |
+| `ROE_WAVE_K=8` | **L4** | 69.9 | 48.0 | 9.3 | **7.9** | **-88.7%** | **-83.6%** | **23.5%** | **7/7 (100%)** |
+| `ROE_WAVE_K=6` | **L4** | 69.9 | 48.0 | 9.3 | **6.0** | **-91.4%** | **-87.4%** | **33.5%** | **7/7 (100%)** |
+| `ROE_WAVE_K=4` | **L4** | 69.9 | 48.0 | 9.3 | **4.0** | **-94.2%** | **-91.6%** | **47.3%** | **7/7 (100%)** |
+
+- **Certification Veto Sûr Globale** : **334 / 334** vetos simples valides + **576 / 576** vetos multi-paquets aléatoires valides = **910 / 910 (100.0% valides, 0 violation R1–R10)**.
+- **Front de Pareto Charge Cognitive vs Granularité du Veto (L4)** : `ROE_WAVE_K=6` constitue le point d'équilibre optimal : la charge opérateur chute de **69.9 routes → 6.0 paquets (`-91.4%`)**, tout en maintenant la valeur à risque maximale d'un veto à `33.5%` et en isolant systématiquement les frappes proches de civils (`HIGH_SCRUTINY_STRIKE`) des frappes propres (`STANDARD_STRIKE`) et de la reconnaissance (`RECON_ONLY`).
+
+**Illustration concrète — Démo Jury `L4-401` ([`demos/c2_demo_L4-401.html`](demos/c2_demo_L4-401.html), 66 drones → 6 approbations, `-90.9%`)** :
+- `PKG-01 [HIGH_SCRUTINY_STRIKE]` — CENTER, min R7 `255 m`, `145–521 s` : 7 cibles (1S + 11E), net `+256.6 pts` (14.9%)
+- `PKG-02 [STANDARD_STRIKE]` — SE, `161–743 s` : 20 cibles (2S + 28E), net `+775.7 pts` (45.2%)
+- `PKG-03 [RECON_ONLY]` — ISR Sweep CENTER, `218–566 s` : 8 cibles `unknown` (2S + 0E), net `+159.0 pts` (9.3%)
+- `PKG-04 [HIGH_SCRUTINY_STRIKE]` — NW, min R7 `218 m`, `254–582 s` : 7 cibles (1S + 11E), net `+241.8 pts` (14.1%)
+- `PKG-05 [STANDARD_STRIKE]` — SE, `262–608 s` : 6 cibles (1S + 7E), net `+189.0 pts` (11.0%)
+- `PKG-06 [STANDARD_STRIKE]` — NW, `377–721 s` : 4 cibles (1S + 1E), net `+95.7 pts` (5.6%)
+
+*(Bug détecté et corrigé durant l'expérimentation : la première passe incluait les contacts `unknown` dans le calcul de `min_collateral_m` d'un paquet mixte, affichant `125 m` alors que R7 ne s'applique qu'aux frappes létales `hostile`. Le filtrage strict sur `HOSTILE` dans [`packages.py`](c2_companion/packages.py) a corrigé la métrique à `255 m` et `218 m`, strictement $\ge 200\text{ m}$.)*
+
+---
