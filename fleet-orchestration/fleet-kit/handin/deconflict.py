@@ -344,11 +344,13 @@ def place_scout_deconflicted(
     sep_index: SeparationIndex,
     preferred_z: float = 30.0,
     max_obs_end_overrides: Optional[Dict[str, float]] = None,
+    prefer_early_climb: bool = False,
 ) -> Optional[Tuple[List[dict], float, Dict[str, float]]]:
     """Places a scout route cleanly into `sep_index` minimizing energy penalty.
 
-    Uses targeted launch-delay (min_t0), landing-advance (max_t_land), uniform shifts,
-    altitude strata, and local 3D dodge chains.
+    When `prefer_early_climb=False`, executes exact nominal ramp fan-out.
+    When `prefer_early_climb=True` (used in strictly-monotonic fallback), prefers 0-Wh
+    early-climb/late-descent profiles + fine 0.5s grid with cliff micro-probing.
     """
     if not contacts:
         return None
@@ -364,7 +366,7 @@ def place_scout_deconflicted(
     for z_idx, z in enumerate(z_candidates):
         obs_pts = obs_map.optimize_disk_tour(ac.home[:2], contacts, z)
 
-        # 1. Try nominal route first
+        # 1. Try nominal route first (or 0-Wh early-climb/late-descent first in fallback mode)
         base = build_scout_route(
             ac, contacts, obs_pts, z, obs_map, scenario,
             max_obs_end_overrides=max_obs_end_overrides,
@@ -374,6 +376,14 @@ def place_scout_deconflicted(
         base_wps, base_e, base_oends = base
         if best_clean is not None and base_e >= best_clean[1] - 1e-4:
             continue
+
+        if prefer_early_climb:
+            vp_nom = _add_vertical_profile(base_wps, ac, obs_map, scenario, climb_z=z, descend_z=z)
+            if vp_nom is not None and vp_nom[1] <= base_e + 0.02 and sep_index.first_conflict(ac.id, vp_nom[0]) is None:
+                best_clean = (vp_nom[0], vp_nom[1], base_oends)
+                if z_idx == 0:
+                    return best_clean
+                continue
 
         conf0 = sep_index.first_conflict(ac.id, base_wps)
         if conf0 is None:
@@ -386,7 +396,12 @@ def place_scout_deconflicted(
         t_land_orig = base_wps[-1]["t"]
 
         # 1b. Early-climb / late-descent vertical profile (0.00 s extra time, 0.00 Wh at z!)
-        for cz, dz in ((z, z), (z + 25.0, None), (None, z + 25.0), (z + 45.0, z + 45.0)):
+        vp_list = (
+            ((z + 25.0, z), (z, z + 25.0), (z + 45.0, z), (z, z + 45.0), (z + 45.0, z + 45.0))
+            if prefer_early_climb
+            else ((z, z), (z + 25.0, None), (None, z + 25.0), (z + 45.0, z + 45.0))
+        )
+        for cz, dz in vp_list:
             vp = _add_vertical_profile(base_wps, ac, obs_map, scenario, climb_z=cz, descend_z=dz)
             if vp is not None and (best_clean is None or vp[1] < best_clean[1] - 1e-4):
                 if sep_index.first_conflict(ac.id, vp[0]) is None:
@@ -406,57 +421,140 @@ def place_scout_deconflicted(
                 continue
             if best_clean is not None and cand[1] >= best_clean[1] - 1e-4:
                 continue
+            if prefer_early_climb:
+                vp_s = _add_vertical_profile(cand[0], ac, obs_map, scenario, climb_z=z, descend_z=z)
+                if vp_s is not None and vp_s[1] <= cand[1] + 0.02 and sep_index.first_conflict(ac.id, vp_s[0]) is None:
+                    best_clean = (vp_s[0], vp_s[1], cand[2])
+                    if z_idx == 0:
+                        return best_clean
+                    break
             if sep_index.first_conflict(ac.id, cand[0]) is None:
                 best_clean = cand
                 if z_idx == 0:
                     return best_clean
                 break
 
-        # 3. Targeted launch delay (min_t0) & landing advance (max_t_land) — fine monotone grid!
-        launch_delays = (1.0, 2.0, 3.0, 4.0, 5.0, 6.5, 8.5, 11.0, 15.0, 21.0, 30.0, 44.0, 62.0)
-        for d_t0 in launch_delays:
-            cand = build_scout_route(
-                ac, contacts, obs_pts, z, obs_map, scenario,
-                max_obs_end_overrides=max_obs_end_overrides,
-                min_t0=t0_orig + d_t0,
-            )
-            if cand is None:
-                break  # Monotone in min_t0: larger delays are also infeasible
-            wps, en, oends = cand
-            if best_clean is not None and en >= best_clean[1] - 1e-4:
-                continue
-            c_hit = sep_index.first_conflict(ac.id, wps)
-            if c_hit is None:
-                best_clean = (wps, en, oends)
-                if z_idx == 0 and en <= base_e + 0.25:
-                    return best_clean
-                break
-            # Try 0-Wh vertical profile on delayed launch
-            vp = _add_vertical_profile(wps, ac, obs_map, scenario, climb_z=z, descend_z=z)
-            if vp is not None and (best_clean is None or vp[1] < best_clean[1] - 1e-4):
-                if sep_index.first_conflict(ac.id, vp[0]) is None:
-                    best_clean = (vp[0], vp[1], oends)
-                    if z_idx == 0 and vp[1] <= base_e + 0.25:
+        # 3. Targeted launch delay (min_t0) & landing advance (max_t_land)
+        if not prefer_early_climb:
+            launch_delays = (1.0, 2.0, 3.0, 4.0, 5.0, 6.5, 8.5, 11.0, 15.0, 21.0, 30.0, 44.0, 62.0)
+            for d_t0 in launch_delays:
+                cand = build_scout_route(
+                    ac, contacts, obs_pts, z, obs_map, scenario,
+                    max_obs_end_overrides=max_obs_end_overrides,
+                    min_t0=t0_orig + d_t0,
+                )
+                if cand is None:
+                    break  # Monotone in min_t0: larger delays are also infeasible
+                wps, en, oends = cand
+                if best_clean is not None and en >= best_clean[1] - 1e-4:
+                    continue
+                c_hit = sep_index.first_conflict(ac.id, wps)
+                if c_hit is None:
+                    best_clean = (wps, en, oends)
+                    if z_idx == 0 and en <= base_e + 0.25:
                         return best_clean
                     break
-            if c_hit[1] > wps[-1]["t"] - 45.0:
-                for d_land in (1.5, 3.0, 4.5, 6.5, 10.0, 16.0, 25.0, 40.0):
-                    cand2 = build_scout_route(
-                        ac, contacts, obs_pts, z, obs_map, scenario,
-                        max_obs_end_overrides=max_obs_end_overrides,
-                        min_t0=t0_orig + d_t0,
-                        max_t_land=wps[-1]["t"] - d_land,
-                    )
-                    if cand2 is None:
+                # Try 0-Wh vertical profile on delayed launch
+                vp = _add_vertical_profile(wps, ac, obs_map, scenario, climb_z=z, descend_z=z)
+                if vp is not None and (best_clean is None or vp[1] < best_clean[1] - 1e-4):
+                    if sep_index.first_conflict(ac.id, vp[0]) is None:
+                        best_clean = (vp[0], vp[1], oends)
+                        if z_idx == 0 and vp[1] <= base_e + 0.25:
+                            return best_clean
                         break
-                    if sep_index.first_conflict(ac.id, cand2[0]) is None:
-                        if best_clean is None or cand2[1] < best_clean[1]:
-                            best_clean = cand2
+                if c_hit[1] > wps[-1]["t"] - 45.0:
+                    for d_land in (1.5, 3.0, 4.5, 6.5, 10.0, 16.0, 25.0, 40.0):
+                        cand2 = build_scout_route(
+                            ac, contacts, obs_pts, z, obs_map, scenario,
+                            max_obs_end_overrides=max_obs_end_overrides,
+                            min_t0=t0_orig + d_t0,
+                            max_t_land=wps[-1]["t"] - d_land,
+                        )
+                        if cand2 is None:
+                            break
+                        if sep_index.first_conflict(ac.id, cand2[0]) is None:
+                            if best_clean is None or cand2[1] < best_clean[1]:
+                                best_clean = cand2
+                            break
+                else:
+                    dodged = _try_dodge_chain(wps, ac, obs_map, scenario, sep_index, max_dodges=3)
+                    if dodged is not None and (best_clean is None or dodged[1] < best_clean[1]):
+                        best_clean = (dodged[0], dodged[1], oends)
                         break
-            else:
+        else:
+            launch_delays = (0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 6.0, 7.5, 9.5, 12.0, 15.5, 21.0, 30.0, 44.0, 62.0)
+
+            def _try_delayed_ec(cand_tuple) -> bool:
+                nonlocal best_clean
+                wps, en, oends = cand_tuple
+                if best_clean is not None and en >= best_clean[1] - 1e-4:
+                    return False
+                vp0 = _add_vertical_profile(wps, ac, obs_map, scenario, climb_z=z, descend_z=z)
+                if vp0 is not None and vp0[1] <= en + 0.02 and sep_index.first_conflict(ac.id, vp0[0]) is None:
+                    best_clean = (vp0[0], vp0[1], oends)
+                    return True
+                c_hit = sep_index.first_conflict(ac.id, wps)
+                if c_hit is None:
+                    best_clean = (wps, en, oends)
+                    return True
+                for cz, dz in ((z + 45.0, z), (z, z + 45.0), (z + 45.0, z + 45.0)):
+                    vp = _add_vertical_profile(wps, ac, obs_map, scenario, climb_z=cz, descend_z=dz)
+                    if vp is not None and (best_clean is None or vp[1] < best_clean[1] - 1e-4):
+                        if sep_index.first_conflict(ac.id, vp[0]) is None:
+                            best_clean = (vp[0], vp[1], oends)
+                            return True
+                if c_hit[1] > wps[-1]["t"] - 45.0:
+                    for d_land in (1.5, 3.0, 4.5, 6.5, 10.0, 16.0, 25.0, 40.0):
+                        cand2 = build_scout_route(
+                            ac, contacts, obs_pts, z, obs_map, scenario,
+                            max_obs_end_overrides=max_obs_end_overrides,
+                            min_t0=wps[0]["t"],
+                            max_t_land=wps[-1]["t"] - d_land,
+                        )
+                        if cand2 is None:
+                            break
+                        vp2 = _add_vertical_profile(cand2[0], ac, obs_map, scenario, climb_z=z, descend_z=z)
+                        if vp2 is not None and vp2[1] <= cand2[1] + 0.02 and sep_index.first_conflict(ac.id, vp2[0]) is None:
+                            if best_clean is None or vp2[1] < best_clean[1]:
+                                best_clean = (vp2[0], vp2[1], cand2[2])
+                            return True
+                        if sep_index.first_conflict(ac.id, cand2[0]) is None:
+                            if best_clean is None or cand2[1] < best_clean[1]:
+                                best_clean = cand2
+                            return True
                 dodged = _try_dodge_chain(wps, ac, obs_map, scenario, sep_index, max_dodges=3)
                 if dodged is not None and (best_clean is None or dodged[1] < best_clean[1]):
                     best_clean = (dodged[0], dodged[1], oends)
+                    return True
+                return False
+
+            prev_dt0 = 0.0
+            for d_t0 in launch_delays:
+                cand = build_scout_route(
+                    ac, contacts, obs_pts, z, obs_map, scenario,
+                    max_obs_end_overrides=max_obs_end_overrides,
+                    min_t0=t0_orig + d_t0,
+                )
+                if cand is None:
+                    step_gap = d_t0 - prev_dt0
+                    if step_gap >= 0.4:
+                        for frac in (0.35, 0.70):
+                            c_mid = build_scout_route(
+                                ac, contacts, obs_pts, z, obs_map, scenario,
+                                max_obs_end_overrides=max_obs_end_overrides,
+                                min_t0=t0_orig + prev_dt0 + step_gap * frac,
+                            )
+                            if c_mid is None:
+                                break
+                            if _try_delayed_ec(c_mid):
+                                if z_idx == 0 and best_clean is not None and best_clean[1] <= base_e + 0.25:
+                                    return best_clean
+                                break
+                    break
+                prev_dt0 = d_t0
+                if _try_delayed_ec(cand):
+                    if z_idx == 0 and best_clean is not None and best_clean[1] <= base_e + 0.25:
+                        return best_clean
                     break
 
         # 4. Landing-only advance (fine monotone grid — catches exact tight slack like d_land=4.5s!)

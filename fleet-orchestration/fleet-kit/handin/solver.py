@@ -1053,7 +1053,13 @@ class FleetSolver:
             "scout_e": scout_e,
         }
 
-    def deconflict_and_build_plan(self, sol: dict, deadline: float) -> Tuple[dict, float]:
+    def deconflict_and_build_plan(
+        self,
+        sol: dict,
+        deadline: float,
+        prefer_early_climb: bool = False,
+        priority_scouts: Optional[Set[int]] = None,
+    ) -> Tuple[dict, float]:
         """Converts an un-deconflicted solution into a 100% R1-R10 valid plan + post-deconfliction polish."""
         sep = SeparationIndex(self.sc)
         obs_end_by_cid: Dict[str, float] = {}
@@ -1078,7 +1084,12 @@ class FleetSolver:
             else:
                 launch_tier[s_idx] = 2
         scout_entries.sort(
-            key=lambda pair: (launch_tier.get(pair[0], 2), self.scouts[pair[0]].usable_wh - sol["tour_e"][pair[0]], -len(pair[1]))
+            key=lambda pair: (
+                0 if (priority_scouts and pair[0] in priority_scouts) else 1,
+                launch_tier.get(pair[0], 2),
+                self.scouts[pair[0]].usable_wh - sol["tour_e"][pair[0]],
+                -len(pair[1]),
+            )
         )
 
         unplaced_scouts: List[Tuple[int, List[str]]] = []
@@ -1086,7 +1097,7 @@ class FleetSolver:
         for s_idx, cids in scout_entries:
             ac = self.scouts[s_idx]
             contacts = [self.contact_map[cid] for cid in cids]
-            res = place_scout_deconflicted(ac, contacts, self.obs_map, self.sc, sep, preferred_z=self.r.z_min_m)
+            res = place_scout_deconflicted(ac, contacts, self.obs_map, self.sc, sep, preferred_z=self.r.z_min_m, prefer_early_climb=prefer_early_climb)
             if res is not None:
                 wps, en, o_ends = res
                 sep.add(ac.id, wps)
@@ -1110,7 +1121,7 @@ class FleetSolver:
                         saved_wps[oid] = sep.routes_json[oid]
                         sep.remove(oid)
                         res_me = place_scout_deconflicted(
-                            ac, contacts, self.obs_map, self.sc, sep, preferred_z=self.r.z_min_m
+                            ac, contacts, self.obs_map, self.sc, sep, preferred_z=self.r.z_min_m, prefer_early_climb=prefer_early_climb
                         )
                         if res_me is not None:
                             sep.add(ac.id, res_me[0])
@@ -1120,7 +1131,7 @@ class FleetSolver:
                                 r_res = place_scout_deconflicted(
                                     self.aircraft_map[rid],
                                     [self.contact_map[x] for x in placed_scout_tours[rid]],
-                                    self.obs_map, self.sc, sep, preferred_z=self.r.z_min_m,
+                                    self.obs_map, self.sc, sep, preferred_z=self.r.z_min_m, prefer_early_climb=prefer_early_climb,
                                 )
                                 if r_res is None:
                                     all_back = False
@@ -1165,7 +1176,7 @@ class FleetSolver:
                     idle_scored.append((ev, idle_ac))
             idle_scored.sort(key=lambda x: x[0])
             for _, idle_ac in idle_scored:
-                res = place_scout_deconflicted(idle_ac, contacts, self.obs_map, self.sc, sep, preferred_z=self.r.z_min_m)
+                res = place_scout_deconflicted(idle_ac, contacts, self.obs_map, self.sc, sep, preferred_z=self.r.z_min_m, prefer_early_climb=prefer_early_climb)
                 if res is not None:
                     sep.add(idle_ac.id, res[0])
                     obs_end_by_cid.update(res[2])
@@ -1194,7 +1205,7 @@ class FleetSolver:
                         saved_bwps[bid] = sep.routes_json[bid]
                         sep.remove(bid)
                         res_ac = place_scout_deconflicted(
-                            ac, contacts, self.obs_map, self.sc, sep, preferred_z=self.r.z_min_m
+                            ac, contacts, self.obs_map, self.sc, sep, preferred_z=self.r.z_min_m, prefer_early_climb=prefer_early_climb
                         )
                         if res_ac is None:
                             continue
@@ -1217,12 +1228,12 @@ class FleetSolver:
                                     continue
                                 eb = self.eval_scout_tour(ia, tuple(bcids))
                                 if eb is not None:
-                                    b_cands.append((1 if hdist(ia.home, ac.home) >= 52.0 else 2, eb, ia))
+                                    b_cands.append((1 if hdist(ia.home, ac.home) >= self.r.d_sep_m + 2.5 else 2, eb, ia))
                             b_cands.sort(key=lambda x: (x[0], x[1]))
                             got = None
                             for _, _, ha in b_cands[:6]:
                                 r_ha = place_scout_deconflicted(
-                                    ha, bcontacts, self.obs_map, self.sc, sep, preferred_z=self.r.z_min_m
+                                    ha, bcontacts, self.obs_map, self.sc, sep, preferred_z=self.r.z_min_m, prefer_early_climb=prefer_early_climb
                                 )
                                 if r_ha is not None:
                                     got = (ha, r_ha)
@@ -1289,7 +1300,7 @@ class FleetSolver:
                     alt_hosts.sort(key=lambda x: x[0])
                     sep.remove(oid)
                     res_new_me = place_scout_deconflicted(
-                        oac, contacts, self.obs_map, self.sc, sep, preferred_z=self.r.z_min_m
+                        oac, contacts, self.obs_map, self.sc, sep, preferred_z=self.r.z_min_m, prefer_early_climb=prefer_early_climb
                     )
                     if res_new_me is not None:
                         sep.add(oac.id, res_new_me[0])
@@ -1297,7 +1308,7 @@ class FleetSolver:
                         moved_other = None
                         for _, ha in alt_hosts[:4]:
                             r_h = place_scout_deconflicted(
-                                ha, ocontacts, self.obs_map, self.sc, sep, preferred_z=self.r.z_min_m
+                                ha, ocontacts, self.obs_map, self.sc, sep, preferred_z=self.r.z_min_m, prefer_early_climb=prefer_early_climb
                             )
                             if r_h is not None:
                                 moved_other = (ha, r_h)
@@ -1357,11 +1368,11 @@ class FleetSolver:
                             continue
                         if best_split is not None and e1 + e2 >= best_split[0] - 1e-4:
                             continue
-                        r1 = place_scout_deconflicted(sa, c1, self.obs_map, self.sc, sep, preferred_z=self.r.z_min_m)
+                        r1 = place_scout_deconflicted(sa, c1, self.obs_map, self.sc, sep, preferred_z=self.r.z_min_m, prefer_early_climb=prefer_early_climb)
                         if r1 is None:
                             continue
                         sep.add(sa.id, r1[0])
-                        r2 = place_scout_deconflicted(sb, c2, self.obs_map, self.sc, sep, preferred_z=self.r.z_min_m)
+                        r2 = place_scout_deconflicted(sb, c2, self.obs_map, self.sc, sep, preferred_z=self.r.z_min_m, prefer_early_climb=prefer_early_climb)
                         sep.remove(sa.id)
                         if r2 is not None and (best_split is None or r1[1] + r2[1] < best_split[0]):
                             best_split = (r1[1] + r2[1], sa, p1, r1, sb, p2, r2)
@@ -1382,7 +1393,7 @@ class FleetSolver:
                 dropped_from_tour: List[str] = []
                 while trim_ac is not None and len(cur_cids) >= 1:
                     res = place_scout_deconflicted(
-                        trim_ac, [self.contact_map[x] for x in cur_cids], self.obs_map, self.sc, sep, preferred_z=self.r.z_min_m
+                        trim_ac, [self.contact_map[x] for x in cur_cids], self.obs_map, self.sc, sep, preferred_z=self.r.z_min_m, prefer_early_climb=prefer_early_climb
                     )
                     if res is not None:
                         sep.add(trim_ac.id, res[0])
@@ -1395,7 +1406,7 @@ class FleetSolver:
                             sub_cids = cur_cids[:drop_idx] + cur_cids[drop_idx + 1 :]
                             sub_contacts = [self.contact_map[x] for x in sub_cids]
                             r_sub = place_scout_deconflicted(
-                                trim_ac, sub_contacts, self.obs_map, self.sc, sep, preferred_z=self.r.z_min_m
+                                trim_ac, sub_contacts, self.obs_map, self.sc, sep, preferred_z=self.r.z_min_m, prefer_early_climb=prefer_early_climb
                             )
                             if r_sub is not None:
                                 kept_val = sum(self.contact_map[x].points for x in sub_cids) - self.r.lambda_e * r_sub[1]
@@ -1425,7 +1436,7 @@ class FleetSolver:
                             scored_d.append((ed, ia))
                     scored_d.sort(key=lambda x: x[0])
                     for _, ia in scored_d[:3]:
-                        r_d = place_scout_deconflicted(ia, [dc], self.obs_map, self.sc, sep, preferred_z=self.r.z_min_m)
+                        r_d = place_scout_deconflicted(ia, [dc], self.obs_map, self.sc, sep, preferred_z=self.r.z_min_m, prefer_early_climb=prefer_early_climb)
                         if r_d is not None:
                             sep.add(ia.id, r_d[0])
                             obs_end_by_cid.update(r_d[2])
@@ -1530,7 +1541,7 @@ class FleetSolver:
                         self.aircraft_map[owner_scout],
                         [self.contact_map[x] for x in tc],
                         self.obs_map, self.sc, sep,
-                        preferred_z=self.r.z_min_m,
+                        preferred_z=self.r.z_min_m, prefer_early_climb=prefer_early_climb,
                         max_obs_end_overrides=max_obs,
                     )
                     if s_res is not None:
@@ -1601,7 +1612,7 @@ class FleetSolver:
                             scored_idle.append((e_solo, ac))
                     scored_idle.sort(key=lambda x: x[0])
                     for _, ac in scored_idle:
-                        s_res = place_scout_deconflicted(ac, [c], self.obs_map, self.sc, sep, preferred_z=self.r.z_min_m)
+                        s_res = place_scout_deconflicted(ac, [c], self.obs_map, self.sc, sep, preferred_z=self.r.z_min_m, prefer_early_climb=prefer_early_climb)
                         if s_res is not None and net_before_scout - self.r.lambda_e * s_res[1] > 0.5:
                             sep.add(ac.id, s_res[0])
                             eff_earliest = {e.id: self.eff_cost[e.id][c.id][1] for e in cand_effs}
@@ -1644,7 +1655,7 @@ class FleetSolver:
                                 max_obs[rc] = min_eng_t - self.r.confirm_margin_s - 0.05
                         res = place_scout_deconflicted(
                             ac, [self.contact_map[x] for x in new_cids], self.obs_map, self.sc, sep,
-                            preferred_z=self.r.z_min_m, max_obs_end_overrides=max_obs,
+                            preferred_z=self.r.z_min_m, prefer_early_climb=prefer_early_climb, max_obs_end_overrides=max_obs,
                         )
                         if res is not None:
                             sep.add(aid, res[0])
@@ -1667,7 +1678,7 @@ class FleetSolver:
                         scored_idle.append((e_solo, ac))
                 scored_idle.sort(key=lambda x: x[0])
                 for _, ac in scored_idle:
-                    res = place_scout_deconflicted(ac, [u], self.obs_map, self.sc, sep, preferred_z=self.r.z_min_m)
+                    res = place_scout_deconflicted(ac, [u], self.obs_map, self.sc, sep, preferred_z=self.r.z_min_m, prefer_early_climb=prefer_early_climb)
                     if res is not None and u.points - self.r.lambda_e * res[1] > 0.5:
                         sep.add(ac.id, res[0])
                         placed_scout_tours[ac.id] = [u.id]
@@ -1933,8 +1944,10 @@ class FleetSolver:
 
         return best
 
-    def _pad_spread_scout_sol(self, sol: dict, min_pad_dist: float = 51.0) -> Optional[dict]:
+    def _pad_spread_scout_sol(self, sol: dict, min_pad_dist: Optional[float] = None) -> Optional[dict]:
         """Re-assigns active scout tours via branch-and-bound + Hungarian so all t0-pinned tours sit >= min_pad_dist apart."""
+        if min_pad_dist is None:
+            min_pad_dist = self.r.d_sep_m + 2.5
         active_tours: List[Tuple[int, List[str]]] = [
             (i, list(sol["tours"][i])) for i in range(len(self.scouts)) if sol["tours"][i]
         ]
@@ -2058,6 +2071,272 @@ class FleetSolver:
         new_sol["scout_e"] = sum(new_tour_e)
         return new_sol
 
+    def _super_scout_liberation(self, sol: dict, deadline: float) -> dict:
+        """Strictly-monotonic Evict-and-Reinsert + Tour-Split Super-Scout Liberation.
+
+        Frees hoarded long-range/fast scouts carrying trivial close targets (which can be
+        absorbed by idle/other scouts) to capture high-margin unserved hostiles & unknowns.
+        """
+        best = sol
+        m = len(self.scouts)
+        if m < 2:
+            return best
+        lam = self.r.lambda_e
+        c_eff = self.r.c_eff
+        cap_l = len(self.lights)
+        cap_h = len(self.heavies)
+        unknown_ids = [u.id for u in self.legal_unknowns]
+
+        reach_cnt: Dict[str, int] = {}
+
+        def get_reach_cnt(cid: str) -> int:
+            if cid not in reach_cnt:
+                reach_cnt[cid] = sum(1 for a in self.scouts if self.eval_scout_tour(a, (cid,)) is not None)
+            return reach_cnt[cid]
+
+        for _round in range(12):
+            if time.monotonic() > deadline:
+                break
+            tours = best["tours"]
+            tour_e = best["tour_e"]
+            active_h = list(best["hostiles"])
+            active_h_set = set(active_h)
+            served_all = {cid for t in tours for cid in t}
+
+            used_l = sum(self.contact_map[cid].needs.get(LIGHT, 0) for cid in active_h)
+            used_h = sum(self.contact_map[cid].needs.get(HEAVY, 0) for cid in active_h)
+            spare_l = cap_l - used_l
+            spare_h = cap_h - used_h
+
+            cands: List[Tuple[float, bool, Contact]] = []
+            for c in self.legal_hostiles:
+                if c.id in active_h_set:
+                    continue
+                nl = c.needs.get(LIGHT, 0)
+                nh = c.needs.get(HEAVY, 0)
+                if nl > spare_l or nh > spare_h:
+                    continue
+                e_solo = self.solo_scout_e.get(c.id, INF)
+                if e_solo >= INF * 0.5:
+                    continue
+                margin = c.points - c_eff * (nl + nh) - lam * (self.est_eff_e.get(c.id, INF) + e_solo)
+                if margin > 1.0:
+                    cands.append((margin, True, c))
+
+            for c in self.legal_unknowns:
+                if c.id in served_all:
+                    continue
+                e_solo = self.solo_scout_e.get(c.id, INF)
+                if e_solo >= INF * 0.5:
+                    continue
+                margin = c.points - lam * e_solo
+                if margin > 1.0:
+                    cands.append((margin, False, c))
+
+            if not cands:
+                break
+            cands.sort(key=lambda x: -x[0])
+
+            improved = False
+            for _margin, is_h, c_u in cands[:14]:
+                if time.monotonic() > deadline:
+                    break
+                feas_scouts: List[Tuple[float, int]] = []
+                for s_idx, ac in enumerate(self.scouts):
+                    e_s = self.eval_scout_tour(ac, (c_u.id,))
+                    if e_s is not None:
+                        feas_scouts.append((e_s, s_idx))
+                feas_scouts.sort()
+
+                best_round_sol: Optional[dict] = None
+                for e_s, s_idx in feas_scouts[:6]:
+                    if time.monotonic() > deadline:
+                        break
+                    evicted = list(tours[s_idx])
+                    new_tours = [list(t) for t in tours]
+                    new_tour_e = list(tour_e)
+                    new_tours[s_idx] = [c_u.id]
+                    new_tour_e[s_idx] = e_s
+
+                    ev_h = [x for x in evicted if self.contact_map[x].cls == HOSTILE]
+                    ev_u = [x for x in evicted if self.contact_map[x].cls == UNKNOWN]
+                    ev_h.sort(key=lambda x: (get_reach_cnt(x), -self.contact_map[x].points))
+
+                    dropped_ev_h: Set[str] = set()
+                    for x in ev_h:
+                        b_de, b_s, b_p = INF, -1, -1
+                        for k_idx in range(m):
+                            de, pos = self._best_insertion_in_tour(
+                                self.scouts[k_idx], new_tours[k_idx], new_tour_e[k_idx], x
+                            )
+                            if de < b_de:
+                                b_de, b_s, b_p = de, k_idx, pos
+                        if b_s != -1:
+                            new_tours[b_s].insert(b_p, x)
+                            new_tour_e[b_s] += b_de
+                            continue
+                        non_empty = [t for t in new_tours if t]
+                        placed_x = False
+                        if len(non_empty) < m:
+                            matched = self._try_hungarian_scout_match(non_empty + [[x]])
+                            if matched is not None:
+                                new_tours, new_tour_e = matched
+                                placed_x = True
+                        if not placed_x and len(non_empty) + 1 < m:
+                            for t_idx, t_seq in enumerate(non_empty):
+                                if len(t_seq) < 2:
+                                    continue
+                                mid = len(t_seq) // 2
+                                cand_ne = (
+                                    non_empty[:t_idx]
+                                    + [t_seq[:mid], t_seq[mid:]]
+                                    + non_empty[t_idx + 1 :]
+                                    + [[x]]
+                                )
+                                matched = self._try_hungarian_scout_match(cand_ne)
+                                if matched is not None:
+                                    new_tours, new_tour_e = matched
+                                    placed_x = True
+                                    break
+                        if not placed_x:
+                            dropped_ev_h.add(x)
+
+                    for x in sorted(ev_u, key=lambda u: -self.contact_map[u].points):
+                        pts_u = self.contact_map[x].points
+                        b_de, b_s, b_p = INF, -1, -1
+                        for k_idx in range(m):
+                            de, pos = self._best_insertion_in_tour(
+                                self.scouts[k_idx], new_tours[k_idx], new_tour_e[k_idx], x
+                            )
+                            if de < b_de:
+                                b_de, b_s, b_p = de, k_idx, pos
+                        if b_s != -1 and pts_u - lam * b_de > 0.0:
+                            new_tours[b_s].insert(b_p, x)
+                            new_tour_e[b_s] += b_de
+
+                    new_h = [h for h in active_h if h not in dropped_ev_h]
+                    if is_h:
+                        new_h.append(c_u.id)
+                    eff_res = self.assign_effectors(new_h)
+                    if eff_res is None:
+                        continue
+                    eff_e, eff_by_cid, earliest_by_cid, eff_duals = eff_res
+
+                    # Fast pre-VND score gate to avoid wasting VND on losing replacements
+                    raw_u = [cid for t in new_tours for cid in t if self.contact_map[cid].cls == UNKNOWN]
+                    raw_pts = sum(self.contact_map[cid].points for cid in new_h) + sum(
+                        self.contact_map[cid].points for cid in raw_u
+                    )
+                    n_effs = sum(len(v) for v in eff_by_cid.values())
+                    raw_sc = raw_pts - c_eff * n_effs - lam * (sum(new_tour_e) + eff_e)
+                    cur_thresh = best_round_sol["score"] if best_round_sol is not None else best["score"]
+                    if raw_sc <= cur_thresh - 3.0:
+                        continue
+
+                    new_tours, new_tour_e = self._vnd_scout_routes(
+                        new_tours, new_tour_e, unknown_ids, deadline, max_passes=1, deep=False
+                    )
+                    scout_e = sum(new_tour_e)
+                    served_u = [cid for t in new_tours for cid in t if self.contact_map[cid].cls == UNKNOWN]
+                    pts = sum(self.contact_map[cid].points for cid in new_h) + sum(
+                        self.contact_map[cid].points for cid in served_u
+                    )
+                    sc_val = pts - c_eff * n_effs - lam * (scout_e + eff_e)
+                    if sc_val > cur_thresh + 0.05:
+                        best_round_sol = {
+                            "score": sc_val,
+                            "hostiles": list(new_h),
+                            "unknowns": served_u,
+                            "tours": new_tours,
+                            "tour_e": new_tour_e,
+                            "eff_by_cid": eff_by_cid,
+                            "earliest_by_cid": earliest_by_cid,
+                            "eff_duals": eff_duals,
+                            "eff_e": eff_e,
+                            "scout_e": scout_e,
+                        }
+
+                if best_round_sol is not None:
+                    best = best_round_sol
+                    improved = True
+                    break
+
+            if not improved:
+                break
+
+        return best
+
+    def _find_troubled_scouts(self, sol: dict, plan: dict) -> Set[int]:
+        """Returns indices of scouts whose planned targets were dropped or unengaged in `plan`."""
+        engaged_h: Set[str] = set()
+        observed_c: Set[str] = set()
+        for rt in plan.get("routes", []):
+            for wp in rt.get("waypoints", []):
+                act = wp.get("action")
+                tgt = wp.get("target")
+                if not tgt:
+                    continue
+                if act == "engage":
+                    engaged_h.add(tgt)
+                elif act == "observe":
+                    observed_c.add(tgt)
+        troubled: Set[int] = set()
+        for s_idx, cids in enumerate(sol["tours"]):
+            for cid in cids:
+                if cid not in observed_c:
+                    troubled.add(s_idx)
+                    break
+                if self.contact_map[cid].cls == HOSTILE and cid not in engaged_h:
+                    troubled.add(s_idx)
+                    break
+        return troubled
+
+    def _run_fallback_trio(
+        self,
+        sol: dict,
+        pass1_plan: Optional[dict],
+        hard_deadline: float,
+        best_sc: float,
+    ) -> Tuple[Optional[dict], float]:
+        """Post-search strictly-monotonic deconfliction fallback trio (zero Stage-6 starvation!).
+
+        Runs Failed-First priority, R8-exact Pad-Spread, and 0-Wh Early-Climb fallbacks
+        using leftover end-of-budget time when a top candidate still has gap > 3.5 pts.
+        """
+        best_plan: Optional[dict] = None
+        if sol["score"] <= best_sc + 3.5 or time.monotonic() > hard_deadline - 2.5:
+            return None, best_sc
+
+        troubled = self._find_troubled_scouts(sol, pass1_plan) if pass1_plan is not None else set()
+
+        # Pass 2: Conflict-Directed Failed-First Priority (troubled scouts BEFORE tier=0!)
+        if troubled and time.monotonic() < hard_deadline - 2.2:
+            p2, sc2 = self.deconflict_and_build_plan(
+                sol, hard_deadline, prefer_early_climb=False, priority_scouts=troubled
+            )
+            if sc2 > best_sc:
+                best_plan, best_sc = p2, sc2
+
+        # Pass 3: R8-exact Pad-Spread Hungarian fallback (d_sep_m + 2.5)
+        if best_sc < sol["score"] - 3.5 and time.monotonic() < hard_deadline - 2.0:
+            spread_sol = self._pad_spread_scout_sol(sol)
+            if spread_sol is not None:
+                p3, sc3 = self.deconflict_and_build_plan(
+                    spread_sol, hard_deadline, prefer_early_climb=False, priority_scouts=(troubled or None)
+                )
+                if sc3 > best_sc:
+                    best_plan, best_sc = p3, sc3
+
+        # Pass 4: 0-Wh Early-Climb / Late-Descent + Fine 0.5s Grid Fallback
+        if best_sc < sol["score"] - 3.5 and time.monotonic() < hard_deadline - 1.8:
+            p4, sc4 = self.deconflict_and_build_plan(
+                sol, hard_deadline, prefer_early_climb=True, priority_scouts=(troubled or None)
+            )
+            if sc4 > best_sc:
+                best_plan, best_sc = p4, sc4
+
+        return best_plan, best_sc
+
     def solve(self, time_budget_s: float = 45.0) -> dict:
         """Main anytime solver entry point, strictly respecting time_budget_s."""
         t_start = time.monotonic()
@@ -2159,7 +2438,7 @@ class FleetSolver:
             if improved["score"] > top_sols[0]["score"] + 1e-4:
                 record_sol(improved)
 
-        # Stage 4: Deep ALNS + deep VND polish on the top-1 solution's scout routes
+        # Stage 4: Deep ALNS + deep VND polish on the top-1 solution's scout routes (100% V9-identical Stages 1-4!)
         if top_sols and time.monotonic() < search_deadline:
             deep_iters = 55 if n_h <= 15 else 45
             polished = self.evaluate_subset(
@@ -2169,9 +2448,17 @@ class FleetSolver:
             if polished is not None and polished["score"] > top_sols[0]["score"] + 1e-4:
                 record_sol(polished)
 
-        # Stage 5: Deconflict top distinct candidate solutions & pick best 100%-validated plan!
+        # Stage 4b: Fast Strictly-Monotonic Super-Scout Liberation (<=0.45s cap -> zero Stage-6 starvation!)
+        if top_sols and time.monotonic() < hard_deadline - 4.0:
+            lib_dl = min(hard_deadline - 3.5, time.monotonic() + 0.45)
+            liberated = self._super_scout_liberation(top_sols[0], lib_dl)
+            if liberated["score"] > top_sols[0]["score"] + 1e-4:
+                record_sol(liberated)
+
+        # Stage 5: Fast nominal V9 deconfliction with dominance skip (preserves 100% of Stage 6 budget!)
         best_plan: dict = {"seed": self.sc.seed, "routes": []}
         best_valid_score: float = 0.0
+        fallback_pool: List[Tuple[dict, dict]] = []  # (sol, pass1_plan) for Stage 7 fallback trio
 
         dedup_sols: List[dict] = []
         seen_keys: Set[Tuple[frozenset, float, float]] = set()
@@ -2184,20 +2471,23 @@ class FleetSolver:
         for idx, sol in enumerate(dedup_sols[:5]):
             if idx > 0 and time.monotonic() > hard_deadline - 2.0:
                 break
+            if sol["score"] <= best_valid_score + 0.05:
+                continue
             plan, score = self.deconflict_and_build_plan(sol, hard_deadline)
             if score > best_valid_score:
                 best_valid_score = score
                 best_plan = plan
-            # Pad-Spread Hungarian fallback whenever deconfliction lost >3.5 pts (e.g., t0-pinned scouts on <50m pads)
-            if score < sol["score"] - 3.5 and time.monotonic() < hard_deadline - 2.0:
-                spread_sol = self._pad_spread_scout_sol(sol)
-                if spread_sol is not None:
-                    sp_plan, sp_score = self.deconflict_and_build_plan(spread_sol, hard_deadline)
-                    if sp_score > best_valid_score:
-                        best_valid_score = sp_score
-                        best_plan = sp_plan
+            if score < sol["score"] - 3.5:
+                fallback_pool.append((sol, plan))
+                if time.monotonic() < hard_deadline - 2.0:
+                    spread_sol = self._pad_spread_scout_sol(sol)
+                    if spread_sol is not None:
+                        sp_plan, sp_score = self.deconflict_and_build_plan(spread_sol, hard_deadline)
+                        if sp_score > best_valid_score:
+                            best_valid_score = sp_score
+                            best_plan = sp_plan
 
-        # Stage 6: Anytime extra restarts if time remains on larger scenarios
+        # Stage 6: Anytime extra restarts (100% full V9 budget, nominal deconfliction only -> fast!)
         if n_h > 8 and time.monotonic() < t_start + time_budget_s * 0.78 and top_sols:
             extra_deadline = t_start + time_budget_s * 0.88
             cur_best = top_sols[0]
@@ -2214,13 +2504,15 @@ class FleetSolver:
                         if r_score > best_valid_score:
                             best_valid_score = r_score
                             best_plan = r_plan
-                        if r_score < r_sol["score"] - 3.5 and time.monotonic() < hard_deadline - 2.0:
-                            sp_sol = self._pad_spread_scout_sol(r_sol)
-                            if sp_sol is not None:
-                                sp_plan, sp_score = self.deconflict_and_build_plan(sp_sol, hard_deadline)
-                                if sp_score > best_valid_score:
-                                    best_valid_score = sp_score
-                                    best_plan = sp_plan
+                        if r_score < r_sol["score"] - 3.5:
+                            fallback_pool.append((r_sol, r_plan))
+                            if time.monotonic() < hard_deadline - 2.0:
+                                sp_sol = self._pad_spread_scout_sol(r_sol)
+                                if sp_sol is not None:
+                                    sp_plan, sp_score = self.deconflict_and_build_plan(sp_sol, hard_deadline)
+                                    if sp_score > best_valid_score:
+                                        best_valid_score = sp_score
+                                        best_plan = sp_plan
             m_scout, m_eff = self._compute_true_marginals(cur_best)
             for p_it in range(12):
                 if time.monotonic() > extra_deadline:
@@ -2234,11 +2526,35 @@ class FleetSolver:
                 if sol is not None and sol["score"] > best_valid_score + 0.5:
                     sol = self._hostile_swap_local_search(sol, extra_deadline, rng)
                     plan, score = self.deconflict_and_build_plan(sol, hard_deadline)
+                    if score < sol["score"] - 3.5:
+                        fallback_pool.append((sol, plan))
                     if score > best_valid_score:
                         best_valid_score = score
                         best_plan = plan
                         top_sols.insert(0, sol)
                         m_scout, m_eff = self._compute_true_marginals(sol)
+                    if time.monotonic() < extra_deadline - 0.5:
+                        lib_sol = self._super_scout_liberation(sol, min(extra_deadline, time.monotonic() + 0.25))
+                        if lib_sol["score"] > sol["score"] + 0.5 and lib_sol["score"] > best_valid_score + 0.5:
+                            l_plan, l_score = self.deconflict_and_build_plan(lib_sol, hard_deadline)
+                            if l_score < lib_sol["score"] - 3.5:
+                                fallback_pool.append((lib_sol, l_plan))
+                            if l_score > best_valid_score:
+                                best_valid_score = l_score
+                                best_plan = l_plan
+                                top_sols.insert(0, lib_sol)
+                                m_scout, m_eff = self._compute_true_marginals(lib_sol)
+
+        # Stage 7: Post-Search Deconfliction Fallback Trio (uses ONLY leftover budget -> 0 Stage-6 starvation!)
+        if fallback_pool and time.monotonic() < hard_deadline - 2.5:
+            fallback_pool.sort(key=lambda pair: -pair[0]["score"])
+            for cand_sol, cand_p1 in fallback_pool[:2]:
+                if cand_sol["score"] <= best_valid_score + 3.5 or time.monotonic() > hard_deadline - 2.5:
+                    break
+                fb_plan, fb_sc = self._run_fallback_trio(cand_sol, cand_p1, hard_deadline, best_valid_score)
+                if fb_plan is not None and fb_sc > best_valid_score:
+                    best_valid_score = fb_sc
+                    best_plan = fb_plan
 
         return best_plan
 
